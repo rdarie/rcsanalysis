@@ -1,5 +1,5 @@
 import sys
-import packet_func
+import rcsanalysis.packet_func as packet_func
 import json
 import pandas as pd
 import datetime

@@ -1,5 +1,7 @@
 import numpy as np
 import pandas as pd
+import seaborn as sns
+from matplotlib import pyplot as plt
 
 """ All the Code Below Is For the Second Generation Packetizer """
 
@@ -7,6 +9,111 @@ import pandas as pd
 def init_numpy_array(input_json, num_cols, data_type):
     num_rows = len(input_json[0][data_type])
     return np.zeros((num_rows, num_cols))
+
+
+def unpack_meta_matrix_time(meta_matrix, intersample_tick_count):
+    # Initialize variables for looping:
+
+    master_time = meta_matrix[0, 3]
+    old_system_tick = 0
+    running_ms_counter = 0
+
+    firstSampleTime = np.zeros(meta_matrix.shape[0])
+    lastSampleTime = np.zeros(meta_matrix.shape[0])
+    
+    for packet_number, i in enumerate(meta_matrix):
+        if i[5]:
+            # We just suffered a macro packet loss...
+            old_system_tick = 0
+            running_ms_counter = 0
+            master_time = i[3]  # Resets the master time
+
+        running_ms_counter += ((i[2] - old_system_tick) % (2 ** 16))
+        backtrack_time = running_ms_counter - ((i[9] - 1) * intersample_tick_count)
+
+        firstSampleTime[packet_number] = backtrack_time / 10
+        lastSampleTime[packet_number] = running_ms_counter / 10
+
+        # Update counters for next loop
+        old_system_tick = i[2]
+
+    return firstSampleTime, lastSampleTime
+
+
+def correct_meta_matrix_consecutive_sys_tick(meta_matrix, frameLength = 500, verbose = False):
+    # correct issue described on page 64 of summit user manual
+    metaMatrix = pd.DataFrame(meta_matrix[:,[1,2]], columns = ['dataTypeSequence','systemTick'])
+    metaMatrix['rolloverGroup'] = (metaMatrix['systemTick'].diff() < 0).cumsum()
+
+    for name, group in metaMatrix.groupby('rolloverGroup'):
+        duplicateSysTick = group.duplicated('systemTick')
+        if duplicateSysTick.any():
+            duplicateIdxs = duplicateSysTick.index[np.flatnonzero(duplicateSysTick)]
+            for duplicateIdx in duplicateIdxs:
+                sysTickVal = group.loc[duplicateIdx,'systemTick']
+                allOccurences = group.loc[group['systemTick'] == sysTickVal, :]
+                if verbose:
+                    print(allOccurences)
+                idxNeedsChanging = allOccurences['dataTypeSequence'].idxmin()
+                # fix it; TODO access deviceLog to find what the frame size actually is
+                
+                meta_matrix[idxNeedsChanging, 2] = meta_matrix[idxNeedsChanging, 2] - 500
+    
+    return meta_matrix
+
+
+def correct_meta_matrix_time_displacement(meta_matrix, intersample_tick_count, verbose = False, plotting = False):
+    
+    tdMeta = pd.DataFrame(
+        meta_matrix[:, [1, 2, 3, 4, 5, 6]],
+        columns=[
+            'dataTypeSequence', 'systemTick', 'masterClock',
+            'microloss', 'macroloss', 'bothloss']
+        )
+
+    firstSampleTime, lastSampleTime = unpack_meta_matrix_time(
+        meta_matrix, intersample_tick_count)
+    tdMeta['firstSampleTime'] = firstSampleTime
+    tdMeta['lastSampleTime'] = lastSampleTime
+
+    # how far is this packet from the preceding one
+    tdMeta['sampleGap'] = tdMeta['firstSampleTime'].values - tdMeta['lastSampleTime'].shift(1).values
+    # how much does this packet overlap the next one?
+    tdMeta['sampleOverlap'] = tdMeta['lastSampleTime'].values - tdMeta['firstSampleTime'].shift(-1).values
+
+    tdMeta['displacementDifference'] = tdMeta['sampleGap'].values - tdMeta['sampleOverlap'].values
+    tdMeta['packetsNotLost'] = ~(tdMeta['microloss'].astype(bool) | tdMeta['macroloss'].astype(bool))
+    tdMeta['packetsOverlapFuture'] = tdMeta['sampleOverlap'] > 0
+
+    if plotting:
+        ax = sns.distplot(
+            tdMeta.loc[tdMeta['packetsNotLost'] & tdMeta['packetsOverlapFuture'], 'sampleGap'].dropna(),
+            label='sampleGap'
+            )
+        ax = sns.distplot(
+            tdMeta.loc[
+                tdMeta['packetsNotLost'] & tdMeta['packetsOverlapFuture'],
+                'sampleOverlap'
+                ].dropna(),
+            label='sampleOverlap'
+            )
+        ax = sns.distplot(
+            tdMeta.loc[
+                tdMeta['packetsNotLost'] & tdMeta['packetsOverlapFuture'],
+                'displacementDifference'].dropna(),
+            label='displacementDifference'
+            )
+        plt.legend()
+        plt.show()
+
+    packetsNeedFixing = tdMeta.index[
+        tdMeta['packetsNotLost'] & tdMeta['packetsOverlapFuture']]
+
+    tdMeta.loc[packetsNeedFixing, 'systemTick'] = tdMeta.loc[
+        packetsNeedFixing, 'systemTick'] - (round(tdMeta.loc[packetsNeedFixing, 'sampleGap'] * 10) - intersample_tick_count)
+    meta_matrix[:, 2] = tdMeta['systemTick'].values
+    
+    return meta_matrix, packetsNeedFixing
 
 
 def extract_td_meta_data(input_json):
@@ -20,8 +127,132 @@ def extract_td_meta_data(input_json):
         meta_matrix[index, 8] = len(packet['ChannelSamples'])
         meta_matrix[index, 9] = packet['Header']['dataSize'] / (2 * len(packet['ChannelSamples']))
         meta_matrix[index, 10] = packet['SampleRate']
+    
+    meta_matrix = correct_meta_matrix_consecutive_sys_tick(meta_matrix, frameLength = 500)
+    
     return meta_matrix
 
+def extract_time_sync_meta_data(input_json):
+    timeSync = input_json['TimeSyncData']
+
+    timeSyncData = pd.DataFrame(
+        columns=['HostUnixTime', 'PacketGenTime', 'LatencyMilliseconds',
+            'dataSize', 'dataType', 'dataTypeSequence', 'globalSequence',
+            'systemTick', 'timestamp', 'microloss', 'macroloss', 'bothloss',
+            'microseconds'
+            ]
+        )
+    for index, packet in enumerate(timeSync):
+        if packet['LatencyMilliseconds'] > 0:
+            entryData = {
+                'HostUnixTime': packet['PacketRxUnixTime'],
+                'PacketGenTime' : packet['PacketGenTime'],
+                'LatencyMilliseconds': packet['LatencyMilliseconds'],
+                'dataSize': packet['Header']['dataSize'],
+                'dataType': packet['Header']['dataType'],
+                'dataTypeSequence': packet['Header']['dataTypeSequence'],
+                'globalSequence': packet['Header']['globalSequence'],
+                'systemTick' : packet['Header']['systemTick'],
+                'timestamp' : packet['Header']['timestamp']['seconds'],
+                'packetIdx' : index,
+                'microloss': 0, 'macroloss': 0, 'bothloss': 0,
+                'microseconds': 0
+                }
+            entrySeries = pd.Series(entryData)
+            timeSyncData = timeSyncData.append(
+                entrySeries, ignore_index=True, sort=True)
+    timeSyncData = timeSyncData[
+        ['dataSize', 'dataTypeSequence', 'systemTick', 'timestamp',
+        'microloss', 'macroloss', 'bothloss',
+        'packetIdx', 'HostUnixTime', 'PacketGenTime', 'LatencyMilliseconds',
+        'dataType', 'globalSequence'
+        ]
+        ]
+    timeSyncData.iloc[:,:] = code_micro_and_macro_packet_loss(timeSyncData.values)
+    
+    old_system_tick = 0
+    running_ms_counter = 0
+    for index, packet in timeSyncData.iterrows():
+        
+        if packet['macroloss']:
+            # We just suffered a macro packet loss...
+            old_system_tick = 0
+            running_ms_counter = 0
+            master_time = packet['timestamp']  # Resets the master time
+
+        running_ms_counter += ((packet['systemTick'] - old_system_tick) % (2 ** 16))
+        
+        old_system_tick = packet['systemTick']
+        timeSyncData.loc[index, 'microseconds'] = running_ms_counter * 100
+
+    return timeSyncData
+
+def extract_stim_meta_data(input_json):
+    stimLog = input_json
+    progAmpNames = ['program{}_amplitude'.format(progIdx) for progIdx in range(4)]
+    progPWNames = ['program{}_pw'.format(progIdx) for progIdx in range(4)]
+
+    stripProgName = lambda x: int(x.split('program')[-1].split('_')[0])
+
+    stimStatus = pd.DataFrame(
+        columns=['HostUnixTime', 'therapyStatus', 'activeGroup', 'frequency'] +
+                ['amplitudeChange', 'pwChange'] + progAmpNames + progPWNames
+        )
+
+    activeGroup = np.nan
+    for entry in stimLog:
+        if 'RecordInfo' in entry.keys():
+            entryData = {'HostUnixTime': entry['RecordInfo']['HostUnixTime']}
+
+        if 'therapyStatusData' in entry.keys():
+            entryData.update(entry['therapyStatusData'])
+            if 'activeGroup' in entry['therapyStatusData'].keys():
+                activeGroup = entry['therapyStatusData']['activeGroup']
+
+        activeGroupSettings = 'TherapyConfigGroup{}'.format(activeGroup)
+        thisAmplitude = None
+        thisPW = None
+        ampChange = False
+        pwChange = False
+        if activeGroupSettings in entry.keys():
+            if 'RateInHz' in entry[activeGroupSettings]:
+                entryData.update(
+                    {'frequency': entry[activeGroupSettings]['RateInHz']}
+                    )
+
+            for progIdx in range(4):
+                programName = 'program{}'.format(progIdx)
+                if programName in entry[activeGroupSettings].keys():
+                    if 'amplitude' in entry[activeGroupSettings][programName]:
+                        thisAmplitude = entry[activeGroupSettings][programName][
+                            'AmplitudeInMilliamps']
+                        entryData.update(
+                            {
+                                programName + '_amplitude': thisAmplitude
+                            }
+                        )
+                        if thisAmplitude > 0:
+                            ampChange = True
+                    if 'pulseWidth' in entry[activeGroupSettings][programName]:
+                        thisPW = entry[activeGroupSettings][programName][
+                            'PulseWidthInMicroseconds']
+                        entryData.update(
+                            {
+                                programName + '_pw': thisPW
+                            }
+                        )
+                        if thisPW > 0:
+                            pwChange = True
+
+        entryData.update({'amplitudeChange': ampChange})
+        entryData.update({'pwChange': pwChange})
+
+        #  was there an amplitude change?
+        entrySeries = pd.Series(entryData)
+        stimStatus = stimStatus.append(entrySeries, ignore_index=True, sort=True)
+
+    stimStatus.fillna(method='ffill', axis=0, inplace=True)
+    return stimStatus
 
 def extract_accel_meta_data(input_json):
     meta_matrix = init_numpy_array(input_json, 11, 'AccelData')
@@ -34,6 +265,9 @@ def extract_accel_meta_data(input_json):
         meta_matrix[index, 8] = 3  # Each accelerometer packet has samples for 3 axes
         meta_matrix[index, 9] = 8  # Number of samples in each channel always 8 for accel data
         meta_matrix[index, 10] = packet['SampleRate']
+    
+    meta_matrix = correct_meta_matrix_consecutive_sys_tick(meta_matrix, frameLength = 500)
+    
     return meta_matrix
 
 
@@ -174,14 +408,18 @@ def unpacker_accel(meta_array, input_json, intersample_tick_count):
     final_array[:, 1] = final_array[:, 1] * 100
     return final_array
 
-def save_to_disk(data_matrix, filename_str, time_format, data_type):
+def save_to_disk(data_matrix, filename_str, time_format, data_type, num_cols=None):
     # TODO: We need to find a different way of dynamically naming columns. Current method won't work.
-    num_cols = data_matrix.shape[1]
+    
+    if num_cols is None:
+        num_cols = data_matrix.shape[1]
+        
     if data_type == 'accel':
         channel_names = ['accel_' + x for x in ['x', 'y', 'z']] # None of his channel name stuff works.
     else:
         channel_names = ['channel_' + str(x) for x in range(0, num_cols)]
-    column_names = ['time_master', 'microseconds'] + channel_names
+
+    column_names = ['time_master', 'microseconds'] + channel_names + ['packetIdx']
     df = pd.DataFrame(data_matrix, columns=column_names)
     if time_format == 'full':
         df.time_master = pd.to_datetime(df.time_master, unit='s', origin=pd.Timestamp('2000-03-01'))
@@ -190,7 +428,7 @@ def save_to_disk(data_matrix, filename_str, time_format, data_type):
     else:
         df['actual_time'] = df.time_master + (df.microseconds / 1E6)
     df.to_csv(filename_str, index=False)
-    return
+    return df
 
 
 def print_session_statistics():
