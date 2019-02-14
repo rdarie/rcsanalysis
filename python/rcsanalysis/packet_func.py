@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 import seaborn as sns
 from matplotlib import pyplot as plt
-
+import pdb
 """ All the Code Below Is For the Second Generation Packetizer """
 
 
@@ -108,9 +108,10 @@ def correct_meta_matrix_time_displacement(meta_matrix, intersample_tick_count, v
 
     packetsNeedFixing = tdMeta.index[
         tdMeta['packetsNotLost'] & tdMeta['packetsOverlapFuture']]
-
+    correctiveValues = tdMeta.loc[packetsNeedFixing, 'sampleGap'].fillna(method = 'bfill') * 10
+    #  pdb.set_trace()
     tdMeta.loc[packetsNeedFixing, 'systemTick'] = tdMeta.loc[
-        packetsNeedFixing, 'systemTick'] - (round(tdMeta.loc[packetsNeedFixing, 'sampleGap'] * 10) - intersample_tick_count)
+        packetsNeedFixing, 'systemTick'] - (round(correctiveValues) - intersample_tick_count)
     meta_matrix[:, 2] = tdMeta['systemTick'].values
     
     return meta_matrix, packetsNeedFixing
@@ -132,11 +133,13 @@ def extract_td_meta_data(input_json):
     
     return meta_matrix
 
+
 def extract_time_sync_meta_data(input_json):
     timeSync = input_json['TimeSyncData']
 
     timeSyncData = pd.DataFrame(
-        columns=['HostUnixTime', 'PacketGenTime', 'LatencyMilliseconds',
+        columns=[
+            'HostUnixTime', 'PacketGenTime', 'LatencyMilliseconds',
             'dataSize', 'dataType', 'dataTypeSequence', 'globalSequence',
             'systemTick', 'timestamp', 'microloss', 'macroloss', 'bothloss',
             'microseconds'
@@ -146,29 +149,30 @@ def extract_time_sync_meta_data(input_json):
         if packet['LatencyMilliseconds'] > 0:
             entryData = {
                 'HostUnixTime': packet['PacketRxUnixTime'],
-                'PacketGenTime' : packet['PacketGenTime'],
+                'PacketGenTime': packet['PacketGenTime'],
                 'LatencyMilliseconds': packet['LatencyMilliseconds'],
                 'dataSize': packet['Header']['dataSize'],
                 'dataType': packet['Header']['dataType'],
                 'dataTypeSequence': packet['Header']['dataTypeSequence'],
                 'globalSequence': packet['Header']['globalSequence'],
-                'systemTick' : packet['Header']['systemTick'],
-                'timestamp' : packet['Header']['timestamp']['seconds'],
-                'packetIdx' : index,
+                'systemTick': packet['Header']['systemTick'],
+                'timestamp': packet['Header']['timestamp']['seconds'],
+                'packetIdx': index,
                 'microloss': 0, 'macroloss': 0, 'bothloss': 0,
                 'microseconds': 0
                 }
             entrySeries = pd.Series(entryData)
             timeSyncData = timeSyncData.append(
                 entrySeries, ignore_index=True, sort=True)
-    timeSyncData = timeSyncData[
-        ['dataSize', 'dataTypeSequence', 'systemTick', 'timestamp',
-        'microloss', 'macroloss', 'bothloss',
-        'packetIdx', 'HostUnixTime', 'PacketGenTime', 'LatencyMilliseconds',
-        'dataType', 'globalSequence'
-        ]
-        ]
-    timeSyncData.iloc[:,:] = code_micro_and_macro_packet_loss(timeSyncData.values)
+    timeSyncData = timeSyncData[[
+            'dataSize', 'dataTypeSequence', 'systemTick', 'timestamp',
+            'microloss', 'macroloss', 'bothloss',
+            'packetIdx', 'HostUnixTime',
+            'PacketGenTime', 'LatencyMilliseconds',
+            'dataType', 'globalSequence'
+        ]]
+    timeSyncData.iloc[:, :] = code_micro_and_macro_packet_loss(
+        timeSyncData.values)
     
     old_system_tick = 0
     running_ms_counter = 0
@@ -178,13 +182,19 @@ def extract_time_sync_meta_data(input_json):
             # We just suffered a macro packet loss...
             old_system_tick = 0
             running_ms_counter = 0
-            master_time = packet['timestamp']  # Resets the master time
 
-        running_ms_counter += ((packet['systemTick'] - old_system_tick) % (2 ** 16))
+        running_ms_counter += (
+            (packet['systemTick'] - old_system_tick) % (2 ** 16))
         
         old_system_tick = packet['systemTick']
         timeSyncData.loc[index, 'microseconds'] = running_ms_counter * 100
-
+        
+    timeSyncData['time_master'] = pd.to_datetime(
+        timeSyncData['timestamp'], unit='s', origin=pd.Timestamp('2000-03-01'))
+    timeSyncData['microseconds'] = pd.to_timedelta(
+        timeSyncData['microseconds'], unit='us')
+    timeSyncData['actual_time'] = timeSyncData['time_master'] + (
+        timeSyncData['microseconds'] / 1e6)
     return timeSyncData
 
 def extract_stim_meta_data(input_json):
@@ -200,6 +210,8 @@ def extract_stim_meta_data(input_json):
         )
 
     activeGroup = np.nan
+    lastUpdate = {'program': 0, 'amplitude': 0}
+
     for entry in stimLog:
         if 'RecordInfo' in entry.keys():
             entryData = {'HostUnixTime': entry['RecordInfo']['HostUnixTime']}
@@ -219,21 +231,46 @@ def extract_stim_meta_data(input_json):
                 entryData.update(
                     {'frequency': entry[activeGroupSettings]['RateInHz']}
                     )
+                overruleAmpChange = True
+            else:
+                overruleAmpChange = False
 
             for progIdx in range(4):
                 programName = 'program{}'.format(progIdx)
                 if programName in entry[activeGroupSettings].keys():
                     if 'amplitude' in entry[activeGroupSettings][programName]:
+
                         thisAmplitude = entry[activeGroupSettings][programName][
                             'AmplitudeInMilliamps']
+                        if not overruleAmpChange:
+                            if (thisAmplitude == 0) & (
+                                    lastUpdate['amplitude'] != 0):
+                                #  don't count this; we're just turning off the previous stim
+                                ampChange = False
+                                lastUpdate = {
+                                    'program': progIdx,
+                                    'amplitude': 0}
+                                
+                            elif (thisAmplitude == 0) & (
+                                    lastUpdate['amplitude'] == 0):
+                                #  count this as a special turning on but at zero
+                                ampChange = True
+                                lastUpdate = {
+                                    'program': progIdx,
+                                    'amplitude': 999}
+                                
+                            else:
+                                ampChange = True
+                                lastUpdate = {
+                                    'program': progIdx,
+                                    'amplitude': thisAmplitude}
                         entryData.update(
                             {
                                 programName + '_amplitude': thisAmplitude
                             }
                         )
-                        if thisAmplitude > 0:
-                            ampChange = True
                     if 'pulseWidth' in entry[activeGroupSettings][programName]:
+                        pwChange = True
                         thisPW = entry[activeGroupSettings][programName][
                             'PulseWidthInMicroseconds']
                         entryData.update(
@@ -241,13 +278,12 @@ def extract_stim_meta_data(input_json):
                                 programName + '_pw': thisPW
                             }
                         )
-                        if thisPW > 0:
-                            pwChange = True
-
-        entryData.update({'amplitudeChange': ampChange})
-        entryData.update({'pwChange': pwChange})
 
         #  was there an amplitude change?
+        entryData.update({'amplitudeChange': ampChange})
+        #  was there a pw change?
+        entryData.update({'pwChange': pwChange})
+
         entrySeries = pd.Series(entryData)
         stimStatus = stimStatus.append(entrySeries, ignore_index=True, sort=True)
 
