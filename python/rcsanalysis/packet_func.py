@@ -40,9 +40,9 @@ def unpack_meta_matrix_time(meta_matrix, intersample_tick_count):
     return firstSampleTime, lastSampleTime
 
 
-def correct_meta_matrix_consecutive_sys_tick(meta_matrix, frameLength = 500, verbose = False):
+def correct_meta_matrix_consecutive_sys_tick(meta_matrix, frameLength=500, verbose=False):
     # correct issue described on page 64 of summit user manual
-    metaMatrix = pd.DataFrame(meta_matrix[:,[1,2]], columns = ['dataTypeSequence','systemTick'])
+    metaMatrix = pd.DataFrame(meta_matrix[:,[1,2]], columns=['dataTypeSequence','systemTick'])
     metaMatrix['rolloverGroup'] = (metaMatrix['systemTick'].diff() < 0).cumsum()
 
     for name, group in metaMatrix.groupby('rolloverGroup'):
@@ -142,7 +142,7 @@ def extract_time_sync_meta_data(input_json):
             'HostUnixTime', 'PacketGenTime', 'LatencyMilliseconds',
             'dataSize', 'dataType', 'dataTypeSequence', 'globalSequence',
             'systemTick', 'timestamp', 'microloss', 'macroloss', 'bothloss',
-            'microseconds'
+            'microseconds', 'time_master'
             ]
         )
     for index, packet in enumerate(timeSync):
@@ -159,7 +159,7 @@ def extract_time_sync_meta_data(input_json):
                 'timestamp': packet['Header']['timestamp']['seconds'],
                 'packetIdx': index,
                 'microloss': 0, 'macroloss': 0, 'bothloss': 0,
-                'microseconds': 0
+                'microseconds': 0, 'time_master': np.nan
                 }
             entrySeries = pd.Series(entryData)
             timeSyncData = timeSyncData.append(
@@ -169,32 +169,36 @@ def extract_time_sync_meta_data(input_json):
             'microloss', 'macroloss', 'bothloss',
             'packetIdx', 'HostUnixTime',
             'PacketGenTime', 'LatencyMilliseconds',
-            'dataType', 'globalSequence'
+            'dataType', 'globalSequence', 'time_master'
         ]]
+    
     timeSyncData.iloc[:, :] = code_micro_and_macro_packet_loss(
         timeSyncData.values)
-    
+    #  pdb.set_trace()
     old_system_tick = 0
     running_ms_counter = 0
+    master_time = timeSyncData['timestamp'].iloc[0]
     for index, packet in timeSyncData.iterrows():
         
         if packet['macroloss']:
             # We just suffered a macro packet loss...
             old_system_tick = 0
             running_ms_counter = 0
+            master_time = packet['timestamp']  # Resets the master time
 
         running_ms_counter += (
             (packet['systemTick'] - old_system_tick) % (2 ** 16))
         
         old_system_tick = packet['systemTick']
         timeSyncData.loc[index, 'microseconds'] = running_ms_counter * 100
+        timeSyncData.loc[index, 'time_master'] = master_time
         
     timeSyncData['time_master'] = pd.to_datetime(
-        timeSyncData['timestamp'], unit='s', origin=pd.Timestamp('2000-03-01'))
+        timeSyncData['time_master'], unit='s', origin=pd.Timestamp('2000-03-01'))
     timeSyncData['microseconds'] = pd.to_timedelta(
         timeSyncData['microseconds'], unit='us')
     timeSyncData['actual_time'] = timeSyncData['time_master'] + (
-        timeSyncData['microseconds'] / 1e6)
+        timeSyncData['microseconds'])
     return timeSyncData
 
 def extract_stim_meta_data(input_json):
@@ -224,50 +228,22 @@ def extract_stim_meta_data(input_json):
         activeGroupSettings = 'TherapyConfigGroup{}'.format(activeGroup)
         thisAmplitude = None
         thisPW = None
-        ampChange = False
-        pwChange = False
         if activeGroupSettings in entry.keys():
             if 'RateInHz' in entry[activeGroupSettings]:
                 entryData.update(
                     {'frequency': entry[activeGroupSettings]['RateInHz']}
                     )
-                overruleAmpChange = True
-            else:
-                overruleAmpChange = False
-
+            ampChange = False
+            pwChange = False
             for progIdx in range(4):
                 programName = 'program{}'.format(progIdx)
                 if programName in entry[activeGroupSettings].keys():
                     if 'amplitude' in entry[activeGroupSettings][programName]:
-
+                        ampChange = True
                         thisAmplitude = entry[activeGroupSettings][programName][
                             'AmplitudeInMilliamps']
-                        if not overruleAmpChange:
-                            if (thisAmplitude == 0) & (
-                                    lastUpdate['amplitude'] != 0):
-                                #  don't count this; we're just turning off the previous stim
-                                ampChange = False
-                                lastUpdate = {
-                                    'program': progIdx,
-                                    'amplitude': 0}
-                                
-                            elif (thisAmplitude == 0) & (
-                                    lastUpdate['amplitude'] == 0):
-                                #  count this as a special turning on but at zero
-                                ampChange = True
-                                lastUpdate = {
-                                    'program': progIdx,
-                                    'amplitude': 999}
-                                
-                            else:
-                                ampChange = True
-                                lastUpdate = {
-                                    'program': progIdx,
-                                    'amplitude': thisAmplitude}
                         entryData.update(
-                            {
-                                programName + '_amplitude': thisAmplitude
-                            }
+                            {programName + '_amplitude': thisAmplitude}
                         )
                     if 'pulseWidth' in entry[activeGroupSettings][programName]:
                         pwChange = True
@@ -278,14 +254,14 @@ def extract_stim_meta_data(input_json):
                                 programName + '_pw': thisPW
                             }
                         )
-
         #  was there an amplitude change?
         entryData.update({'amplitudeChange': ampChange})
         #  was there a pw change?
         entryData.update({'pwChange': pwChange})
 
         entrySeries = pd.Series(entryData)
-        stimStatus = stimStatus.append(entrySeries, ignore_index=True, sort=True)
+        stimStatus = stimStatus.append(
+            entrySeries, ignore_index=True, sort=True)
 
     stimStatus.fillna(method='ffill', axis=0, inplace=True)
     return stimStatus
@@ -298,11 +274,13 @@ def extract_accel_meta_data(input_json):
         meta_matrix[index, 2] = packet['Header']['systemTick']
         meta_matrix[index, 3] = packet['Header']['timestamp']['seconds']
         meta_matrix[index, 7] = index
-        meta_matrix[index, 8] = 3  # Each accelerometer packet has samples for 3 axes
+        #  Each accelerometer packet has samples for 3 axes
+        meta_matrix[index, 8] = 3
         meta_matrix[index, 9] = 8  # Number of samples in each channel always 8 for accel data
         meta_matrix[index, 10] = packet['SampleRate']
     
-    meta_matrix = correct_meta_matrix_consecutive_sys_tick(meta_matrix, frameLength = 500)
+    meta_matrix = correct_meta_matrix_consecutive_sys_tick(
+        meta_matrix, frameLength = 500)
     
     return meta_matrix
 
