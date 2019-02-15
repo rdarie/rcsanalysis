@@ -40,21 +40,32 @@ def unpack_meta_matrix_time(meta_matrix, intersample_tick_count):
     return firstSampleTime, lastSampleTime
 
 
-def correct_meta_matrix_consecutive_sys_tick(meta_matrix, frameLength=500, verbose=False):
+def correct_meta_matrix_consecutive_sys_tick(
+        meta_matrix, frameLength=500, verbose=True):
     # correct issue described on page 64 of summit user manual
-    metaMatrix = pd.DataFrame(meta_matrix[:,[1,2]], columns=['dataTypeSequence','systemTick'])
-    metaMatrix['rolloverGroup'] = (metaMatrix['systemTick'].diff() < 0).cumsum()
+    metaMatrix = pd.DataFrame(
+        meta_matrix[:, [1, 2, -1]],
+        columns=['dataTypeSequence', 'systemTick', 'packetIdx'])
+    metaMatrix['rolloverGroup'] = (
+        metaMatrix['systemTick'].diff() < 0).cumsum()
 
     for name, group in metaMatrix.groupby('rolloverGroup'):
         duplicateSysTick = group.duplicated('systemTick')
         if duplicateSysTick.any():
             duplicateIdxs = duplicateSysTick.index[np.flatnonzero(duplicateSysTick)]
             for duplicateIdx in duplicateIdxs:
-                sysTickVal = group.loc[duplicateIdx,'systemTick']
+                sysTickVal = group.loc[duplicateIdx, 'systemTick']
                 allOccurences = group.loc[group['systemTick'] == sysTickVal, :]
                 if verbose:
                     print(allOccurences)
-                idxNeedsChanging = allOccurences['dataTypeSequence'].idxmin()
+                atMax = allOccurences['dataTypeSequence'] == 255
+                dtSequence = allOccurences['dataTypeSequence'].copy()
+                dtSequence.loc[atMax] = -1
+                idxNeedsChanging = dtSequence.idxmin()
+                
+                #  if 2815 in group['packetIdx']:
+                #      print('at packet_func')
+                #      pdb.set_trace()
                 # fix it; TODO access deviceLog to find what the frame size actually is
                 
                 meta_matrix[idxNeedsChanging, 2] = meta_matrix[idxNeedsChanging, 2] - 500
@@ -62,7 +73,8 @@ def correct_meta_matrix_consecutive_sys_tick(meta_matrix, frameLength=500, verbo
     return meta_matrix
 
 
-def correct_meta_matrix_time_displacement(meta_matrix, intersample_tick_count, verbose = False, plotting = False):
+def correct_meta_matrix_time_displacement(
+    meta_matrix, intersample_tick_count, verbose=False, plotting=False):
     
     tdMeta = pd.DataFrame(
         meta_matrix[:, [1, 2, 3, 4, 5, 6]],
@@ -129,7 +141,8 @@ def extract_td_meta_data(input_json):
         meta_matrix[index, 9] = packet['Header']['dataSize'] / (2 * len(packet['ChannelSamples']))
         meta_matrix[index, 10] = packet['SampleRate']
     
-    meta_matrix = correct_meta_matrix_consecutive_sys_tick(meta_matrix, frameLength = 500)
+    meta_matrix = correct_meta_matrix_consecutive_sys_tick(
+        meta_matrix, frameLength=500)
     
     return meta_matrix
 
