@@ -5,11 +5,17 @@ from matplotlib import pyplot as plt
 import pdb
 """ All the Code Below Is For the Second Generation Packetizer """
 
+progAmpNames = ['program{}_amplitude'.format(progIdx) for progIdx in range(4)]
+progPWNames = ['program{}_pw'.format(progIdx) for progIdx in range(4)]
+
 
 def init_numpy_array(input_json, num_cols, data_type):
     num_rows = len(input_json[0][data_type])
     return np.zeros((num_rows, num_cols))
 
+
+def strip_prog_name(x):
+    return int(x.split('program')[-1].split('_')[0])
 
 def unpack_meta_matrix_time(meta_matrix, intersample_tick_count):
     # Initialize variables for looping:
@@ -66,7 +72,7 @@ def correct_meta_matrix_consecutive_sys_tick(
                 #  if 2815 in group['packetIdx']:
                 #      print('at packet_func')
                 #      pdb.set_trace()
-                # fix it; TODO access deviceLog to find what the frame size actually is
+                #TODO access deviceLog to find what the frame size actually is
                 
                 meta_matrix[idxNeedsChanging, 2] = meta_matrix[idxNeedsChanging, 2] - 500
     
@@ -214,12 +220,9 @@ def extract_time_sync_meta_data(input_json):
         timeSyncData['microseconds'])
     return timeSyncData
 
+
 def extract_stim_meta_data(input_json):
     stimLog = input_json
-    progAmpNames = ['program{}_amplitude'.format(progIdx) for progIdx in range(4)]
-    progPWNames = ['program{}_pw'.format(progIdx) for progIdx in range(4)]
-
-    stripProgName = lambda x: int(x.split('program')[-1].split('_')[0])
 
     stimStatus = pd.DataFrame(
         columns=['HostUnixTime', 'therapyStatus', 'activeGroup', 'frequency'] +
@@ -278,6 +281,70 @@ def extract_stim_meta_data(input_json):
 
     stimStatus.fillna(method='ffill', axis=0, inplace=True)
     return stimStatus
+
+
+def extract_stim_meta_data_events(input_json, trialSegment=None):
+    stimLog = input_json
+
+    eventsList = []
+
+    lastUpdate = {
+        'activeGroup': np.nan, 'therapyStatus': np.nan,
+        'program': np.nan, 'RateInHz': np.nan}
+    lastUpdate.update({progName: 0 for progName in progAmpNames})
+    for idx, entry in enumerate(stimLog):
+        theseEvents = []
+        if 'RecordInfo' in entry.keys():
+            hostUnixTime = entry['RecordInfo']['HostUnixTime']
+            if (trialSegment is not None) and len(eventsList) == 0:
+                theseEvents.append(pd.DataFrame({
+                    'HostUnixTime': hostUnixTime,
+                    'ins_property': 'trialSegment', 'ins_value': trialSegment},
+                    index=[0]))
+
+        if 'therapyStatusData' in entry.keys():
+            for key in ['activeGroup', 'therapyStatus']:
+                if key in entry['therapyStatusData'].keys():
+                    value = entry['therapyStatusData'][key]
+                    theseEvents.append(pd.DataFrame({
+                        'HostUnixTime': hostUnixTime,
+                        'ins_property': key, 'ins_value': value},
+                        index=[0]))
+                    lastUpdate[key] = value
+
+        configGroupName = (
+            'TherapyConfigGroup{}'.format(lastUpdate['activeGroup']))
+        if configGroupName in entry.keys():            
+            updateOrder = [
+                'RateInHz', 'ratePeriod',
+                'program0', 'program1',
+                'program2', 'program3']
+            for key in updateOrder:
+                if key in entry[configGroupName].keys():
+                    value = entry[configGroupName][key]
+                    if 'program' in key:
+                        #  program level update
+                        progIdx = int(key[-1])
+                        theseEvents.append(pd.DataFrame({
+                            'HostUnixTime': hostUnixTime,
+                            'ins_property': 'program', 'ins_value': progIdx},
+                            index=[0]))
+                        for progKey, progValue in value.items():
+                            if progKey in ['amplitude', 'pulseWidth']:
+                                theseEvents.append(pd.DataFrame({
+                                    'HostUnixTime': hostUnixTime,
+                                    'ins_property': progKey, 'ins_value': progValue},
+                                    index=[0]))
+                                lastUpdate[key + '_'+progKey] = progValue
+                    else:
+                        #  group level update
+                        theseEvents.append(pd.DataFrame({
+                            'HostUnixTime': hostUnixTime,
+                            'ins_property': key, 'ins_value': value},
+                            index=[0]))
+                        lastUpdate[key] = value
+        eventsList = eventsList + theseEvents
+    return pd.concat(eventsList, ignore_index=True, sort=True)
 
 def extract_accel_meta_data(input_json):
     meta_matrix = init_numpy_array(input_json, 11, 'AccelData')
