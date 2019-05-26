@@ -1,0 +1,27 @@
+{
+    "remotePath": "/users/rdarie/Github/rcsanalysis",
+    "host": "ssh.ccv.brown.edu",
+    "username": "rdarie",
+    "password": "Monkey$2018",
+    "port": 22,
+    "secure": true,
+    "protocol": "sftp",
+    "uploadOnSave": false,
+    "passive": false,
+    "debug": false,
+    "privateKeyPath": null,
+    "passphrase": null,
+    "agent": null,
+    "allow": [],
+    "ignore": [
+        "\\.vscode",
+        "\\.git",
+        "\\.DS_Store"
+    ],
+    "generatedFiles": {
+        "extensionsToInclude": [
+            ""
+        ],
+        "path": ""
+    }
+}
