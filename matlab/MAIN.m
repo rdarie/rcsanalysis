@@ -13,15 +13,53 @@ else
     filename  = varargin{1};
 end
 
-jsonobj = deserializeJSON(filename);
-if ~isempty(strfind(filename,'RawDataTD'))
-    [outtable, srates] = unravelData(jsonobj);
+% check if you have a preloaded / converted json and load that 
+% this is mainly so you can batch covnert many files at once on server 
+[pn,fn,ext] = fileparts(filename);
+if exist(fullfile(pn,[fn '_json_only_.mat' ]),'file') == 2
+    load(fullfile(pn,[fn '_json_only_.mat' ]),'jsonojb');
+    jsonobj = jsonojb; % consider fixing this type in next versions... XXXXXX
+else
+    jsonobj = deserializeJSON(filename);
 end
 
-if ~isempty(strfind(filename,'RawDataAccel'))
-    [outtable, srates] = unravelDataACC(jsonobj);
+
+
+
+
+if ~isempty(strfind(filename,'RawDataTD'))
+    if ~isempty(jsonobj)
+        if ~isempty(jsonobj.TimeDomainData)  % no data exists
+            [outtable, srates] = unravelData(jsonobj);
+        else
+            outtable = table();
+            srates = [];
+        end
+    else
+        outtable = table();
+        srates = [];
+    end
 end
-outdatcomplete = populateTimeStamp(outtable,srates,filename); 
+
+
+if ~isempty(strfind(filename,'RawDataAccel'))
+    if ~isempty(jsonobj)
+        if ~isempty(jsonobj.AccelData)  % no data exists
+            [outtable, srates] = unravelDataACC(jsonobj);
+        else
+            outtable = table();
+            srates = [];
+        end
+    else
+        outtable = table();
+        srates = [];
+    end
+end
+if ~isempty(outtable)
+    outdatcomplete = populateTimeStamp(outtable,srates,filename);
+else
+    outdatcomplete = table();
+end
 [pn,fn,ext] = fileparts(filename); 
 % writetable(outdatcomplete,fullfile(pn,[fn '.csv']));
 unqsrates = unique(srates); 
