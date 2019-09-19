@@ -7,7 +7,7 @@ import pdb
 
 progAmpNames = ['program{}_amplitude'.format(progIdx) for progIdx in range(4)]
 progPWNames = ['program{}_pw'.format(progIdx) for progIdx in range(4)]
-
+groupConfigNames = ['TherapyConfigGroup{}'.format(grpIdx) for grpIdx in range(4)]
 
 def init_numpy_array(input_json, num_cols, data_type):
     num_rows = len(input_json[0][data_type])
@@ -22,60 +22,59 @@ def unpack_meta_matrix_time(meta_matrix, intersample_tick_count):
 
     master_time = meta_matrix[0, 3]
     old_system_tick = 0
-    running_ms_counter = 0
+    running_tick_counter = 0
 
-    firstSampleTime = np.zeros(meta_matrix.shape[0])
-    lastSampleTime = np.zeros(meta_matrix.shape[0])
+    firstSampleTick = np.zeros(meta_matrix.shape[0])
+    lastSampleTick = np.zeros(meta_matrix.shape[0])
     
     for packet_number, i in enumerate(meta_matrix):
         if i[5]:
             # We just suffered a macro packet loss...
             old_system_tick = 0
-            running_ms_counter = 0
+            running_tick_counter = 0
             master_time = i[3]  # Resets the master time
 
-        running_ms_counter += ((i[2] - old_system_tick) % (2 ** 16))
-        backtrack_time = running_ms_counter - ((i[9] - 1) * intersample_tick_count)
+        running_tick_counter += ((i[2] - old_system_tick) % (2 ** 16))
+        backtrack_time = running_tick_counter - ((i[9] - 1) * intersample_tick_count)
 
-        firstSampleTime[packet_number] = backtrack_time / 10
-        lastSampleTime[packet_number] = running_ms_counter / 10
+        firstSampleTick[packet_number] = backtrack_time
+        lastSampleTick[packet_number] = running_tick_counter
 
         # Update counters for next loop
         old_system_tick = i[2]
 
-    return firstSampleTime, lastSampleTime
+    return firstSampleTick, lastSampleTick
 
 
 def correct_meta_matrix_consecutive_sys_tick(
-        meta_matrix, frameLength=500, verbose=True):
+        meta_matrix, verbose=False):
     # correct issue described on page 64 of summit user manual
     metaMatrix = pd.DataFrame(
         meta_matrix[:, [1, 2, -1]],
         columns=['dataTypeSequence', 'systemTick', 'packetIdx'])
-    metaMatrix['rolloverGroup'] = (
-        metaMatrix['systemTick'].diff() < 0).cumsum()
-
+    allFrameLengths = metaMatrix['systemTick'].diff()
+    metaMatrix['rolloverGroup'] = (allFrameLengths < 0).cumsum()
+    #TODO access deviceLog to find what the nominal frame size actually is
+    frameLength = allFrameLengths.value_counts().idxmax()
     for name, group in metaMatrix.groupby('rolloverGroup'):
-        duplicateSysTick = group.duplicated('systemTick')
+        # duplicateSysTick = group.duplicated('systemTick')
+        duplicateSysTick = group['systemTick'].diff() == 0
         if duplicateSysTick.any():
             duplicateIdxs = duplicateSysTick.index[np.flatnonzero(duplicateSysTick)]
             for duplicateIdx in duplicateIdxs:
                 sysTickVal = group.loc[duplicateIdx, 'systemTick']
                 allOccurences = group.loc[group['systemTick'] == sysTickVal, :]
-                if verbose:
-                    print(allOccurences)
-                atMax = allOccurences['dataTypeSequence'] == 255
-                dtSequence = allOccurences['dataTypeSequence'].copy()
-                dtSequence.loc[atMax] = -1
-                idxNeedsChanging = dtSequence.idxmin()
-                
-                #  if 2815 in group['packetIdx']:
-                #      print('at packet_func')
-                #      pdb.set_trace()
-                #TODO access deviceLog to find what the frame size actually is
-                
-                meta_matrix[idxNeedsChanging, 2] = meta_matrix[idxNeedsChanging, 2] - 500
-    
+                assert len(allOccurences) == 2
+                #  'dataTypeSequence' rolls over, correct for it
+                specialCase = (
+                    (allOccurences['dataTypeSequence'] == 255).any() &
+                    (allOccurences['dataTypeSequence'] == 0).any()
+                )
+                if specialCase:
+                    idxNeedsChanging = allOccurences['dataTypeSequence'].idxmax()
+                else:
+                    idxNeedsChanging = allOccurences['dataTypeSequence'].idxmin()
+                meta_matrix[idxNeedsChanging, 2] = meta_matrix[idxNeedsChanging, 2] - frameLength
     return meta_matrix
 
 
@@ -83,72 +82,82 @@ def correct_meta_matrix_time_displacement(
     meta_matrix, intersample_tick_count, verbose=False, plotting=False):
     
     tdMeta = pd.DataFrame(
-        meta_matrix[:, [1, 2, 3, 4, 5, 6]],
+        meta_matrix[:, [1, 2, 3, 4, 5, 6, 9]],
         columns=[
             'dataTypeSequence', 'systemTick', 'masterClock',
-            'microloss', 'macroloss', 'bothloss']
+            'microloss', 'macroloss', 'bothloss', 'packetSize']
         )
 
-    firstSampleTime, lastSampleTime = unpack_meta_matrix_time(
+    firstSampleTick, lastSampleTick = unpack_meta_matrix_time(
         meta_matrix, intersample_tick_count)
-    tdMeta['firstSampleTime'] = firstSampleTime
-    tdMeta['lastSampleTime'] = lastSampleTime
+    tdMeta['firstSampleTick'] = firstSampleTick
+    tdMeta['lastSampleTick'] = lastSampleTick
 
     # how far is this packet from the preceding one
-    tdMeta['sampleGap'] = tdMeta['firstSampleTime'].values - tdMeta['lastSampleTime'].shift(1).values
+    tdMeta['sampleGap'] = tdMeta['firstSampleTick'].values - tdMeta['lastSampleTick'].shift(1).values
     # how much does this packet overlap the next one?
-    tdMeta['sampleOverlap'] = tdMeta['lastSampleTime'].values - tdMeta['firstSampleTime'].shift(-1).values
+    tdMeta['sampleOverlap'] = tdMeta['lastSampleTick'].values - tdMeta['firstSampleTick'].shift(-1).values
 
-    tdMeta['displacementDifference'] = tdMeta['sampleGap'].values - tdMeta['sampleOverlap'].values
+    tdMeta['displacementDifference'] = (tdMeta['sampleGap'].values + tdMeta['sampleOverlap'].values) / 2
     tdMeta['packetsNotLost'] = ~(tdMeta['microloss'].astype(bool) | tdMeta['macroloss'].astype(bool))
+    #
     tdMeta['packetsOverlapFuture'] = tdMeta['sampleOverlap'] > 0
-
-    if plotting:
+    #
+    # packetsNeedFixing = tdMeta.index[
+    #     tdMeta['packetsNotLost'] & tdMeta['packetsOverlapFuture']]
+    packetsNeedFixing = tdMeta.index[tdMeta['packetsOverlapFuture']]
+    if plotting and packetsNeedFixing.any():
         ax = sns.distplot(
-            tdMeta.loc[tdMeta['packetsNotLost'] & tdMeta['packetsOverlapFuture'], 'sampleGap'].dropna(),
+            tdMeta.loc[packetsNeedFixing, 'sampleGap'].dropna(),
             label='sampleGap'
             )
         ax = sns.distplot(
-            tdMeta.loc[
-                tdMeta['packetsNotLost'] & tdMeta['packetsOverlapFuture'],
-                'sampleOverlap'
-                ].dropna(),
+            tdMeta.loc[packetsNeedFixing, 'sampleOverlap'].dropna(),
             label='sampleOverlap'
             )
         ax = sns.distplot(
-            tdMeta.loc[
-                tdMeta['packetsNotLost'] & tdMeta['packetsOverlapFuture'],
-                'displacementDifference'].dropna(),
+            tdMeta.loc[packetsNeedFixing, 'displacementDifference'].dropna(),
             label='displacementDifference'
             )
         plt.legend()
         plt.show()
-
-    packetsNeedFixing = tdMeta.index[
-        tdMeta['packetsNotLost'] & tdMeta['packetsOverlapFuture']]
-    correctiveValues = tdMeta.loc[packetsNeedFixing, 'sampleGap'].fillna(method = 'bfill') * 10
-    #  pdb.set_trace()
-    tdMeta.loc[packetsNeedFixing, 'systemTick'] = tdMeta.loc[
-        packetsNeedFixing, 'systemTick'] - (round(correctiveValues) - intersample_tick_count)
+    # calc correction:
+    nextGoodSysTicks = tdMeta.loc[packetsNeedFixing + 1, 'systemTick']
+    nextGoodPacketSizes = tdMeta.loc[packetsNeedFixing + 1, 'packetSize']
+    correctedSysTicks = (
+        nextGoodSysTicks.to_numpy() -
+        nextGoodPacketSizes.to_numpy() * intersample_tick_count)
+    # pdb.set_trace()
+    tdMeta.loc[packetsNeedFixing, 'systemTick'] = correctedSysTicks
+    #print(tdMeta.loc[packetsNeedFixing, 'systemTick'])
+    #print('difference in systicks is\n{}'.format(tdMeta.loc[packetsNeedFixing, 'systemTick'] - correctedSysTicks))
+    #print('original sample gap was\n{}'.format(tdMeta.loc[packetsNeedFixing, 'sampleGap']))
+    #tdMeta.loc[packetsNeedFixing + 1, 'lastSampleTick']
+    # correctiveValues = tdMeta.loc[packetsNeedFixing, 'sampleGap'].fillna(method = 'bfill') * 10
+    # tdMeta.loc[packetsNeedFixing, 'systemTick'] = tdMeta.loc[
+    #     packetsNeedFixing, 'systemTick'] - (round(correctiveValues) - intersample_tick_count)
     meta_matrix[:, 2] = tdMeta['systemTick'].values
-    
+    #
+    # meta_matrix[:, 11] = tdMeta['packetsOverlapFuture'].to_numpy()
     return meta_matrix, packetsNeedFixing
 
 
 def extract_td_meta_data(input_json):
-    meta_matrix = init_numpy_array(input_json, 11, 'TimeDomainData')
+    meta_matrix = init_numpy_array(input_json, 12, 'TimeDomainData')
     for index, packet in enumerate(input_json[0]['TimeDomainData']):
         meta_matrix[index, 0] = packet['Header']['dataSize']
         meta_matrix[index, 1] = packet['Header']['dataTypeSequence']
         meta_matrix[index, 2] = packet['Header']['systemTick']
         meta_matrix[index, 3] = packet['Header']['timestamp']['seconds']
+        # 4 will hold microloss
+        # 5 will hold macroloss
+        # 6 will hold coincidence of losses
         meta_matrix[index, 7] = index
         meta_matrix[index, 8] = len(packet['ChannelSamples'])
         meta_matrix[index, 9] = packet['Header']['dataSize'] / (2 * len(packet['ChannelSamples']))
         meta_matrix[index, 10] = packet['SampleRate']
-    
-    meta_matrix = correct_meta_matrix_consecutive_sys_tick(
-        meta_matrix, frameLength=500)
+        # 11 will hold future overlap
+    meta_matrix = correct_meta_matrix_consecutive_sys_tick(meta_matrix)
     
     return meta_matrix
 
@@ -190,15 +199,14 @@ def extract_time_sync_meta_data(input_json):
             'PacketGenTime', 'LatencyMilliseconds',
             'dataType', 'globalSequence', 'time_master'
         ]]
-    
+    timeSyncData.iloc[:, :] = correct_meta_matrix_consecutive_sys_tick(
+        timeSyncData.values)
     timeSyncData.iloc[:, :] = code_micro_and_macro_packet_loss(
         timeSyncData.values)
-    #  pdb.set_trace()
     old_system_tick = 0
     running_ms_counter = 0
     master_time = timeSyncData['timestamp'].iloc[0]
     for index, packet in timeSyncData.iterrows():
-        
         if packet['macroloss']:
             # We just suffered a macro packet loss...
             old_system_tick = 0
@@ -287,10 +295,11 @@ def extract_stim_meta_data_events(input_json, trialSegment=None):
     stimLog = input_json
 
     eventsList = []
-
+    
     lastUpdate = {
         'activeGroup': np.nan, 'therapyStatus': np.nan,
         'program': np.nan, 'RateInHz': np.nan}
+    groupRates = {i: {'RateInHz': np.nan, 'ratePeriod': np.nan} for i in range(4)}
     lastUpdate.update({progName: 0 for progName in progAmpNames})
     for idx, entry in enumerate(stimLog):
         theseEvents = []
@@ -311,17 +320,23 @@ def extract_stim_meta_data_events(input_json, trialSegment=None):
                         'ins_property': key, 'ins_value': value},
                         index=[0]))
                     lastUpdate[key] = value
-
-        configGroupName = (
+        
+        for grpIdx, confGrpName in enumerate(groupConfigNames):
+            if confGrpName in entry.keys():
+                if 'RateInHz' in entry[confGrpName].keys():
+                    groupRates[grpIdx]['RateInHz'] = entry[confGrpName]['RateInHz']
+                    groupRates[grpIdx]['ratePeriod'] = entry[confGrpName]['ratePeriod']
+        
+        thisConfGroupName = (
             'TherapyConfigGroup{}'.format(lastUpdate['activeGroup']))
-        if configGroupName in entry.keys():            
+        if thisConfGroupName in entry.keys():
             updateOrder = [
                 'RateInHz', 'ratePeriod',
                 'program0', 'program1',
                 'program2', 'program3']
             for key in updateOrder:
-                if key in entry[configGroupName].keys():
-                    value = entry[configGroupName][key]
+                if key in entry[thisConfGroupName].keys():
+                    value = entry[thisConfGroupName][key]
                     if 'program' in key:
                         #  program level update
                         progIdx = int(key[-1])
@@ -335,7 +350,7 @@ def extract_stim_meta_data_events(input_json, trialSegment=None):
                                     'HostUnixTime': hostUnixTime,
                                     'ins_property': progKey, 'ins_value': progValue},
                                     index=[0]))
-                                lastUpdate[key + '_'+progKey] = progValue
+                                lastUpdate[key + '_' + progKey] = progValue
                     else:
                         #  group level update
                         theseEvents.append(pd.DataFrame({
@@ -343,24 +358,42 @@ def extract_stim_meta_data_events(input_json, trialSegment=None):
                             'ins_property': key, 'ins_value': value},
                             index=[0]))
                         lastUpdate[key] = value
-        eventsList = eventsList + theseEvents
+        if len(theseEvents):
+            theseEventsDF = pd.concat(theseEvents, ignore_index=True, sort=True)
+            #
+            recordedGroupChange = theseEventsDF['ins_property'].str.contains('activeGroup').any()
+            recordedRateChange = theseEventsDF['ins_property'].str.contains('RateInHz').any()
+            if recordedGroupChange and not recordedRateChange:
+                for k, v in groupRates[lastUpdate['activeGroup']].items():
+                    fillerDF = pd.DataFrame({
+                        'HostUnixTime': hostUnixTime,
+                        'ins_property': k, 'ins_value': v},
+                        index=[0])
+                    theseEventsDF = pd.concat(
+                        [theseEventsDF, fillerDF],
+                        ignore_index=True, sort=True)
+                #pdb.set_trace()
+            eventsList.append(theseEventsDF)
     return pd.concat(eventsList, ignore_index=True, sort=True)
 
 def extract_accel_meta_data(input_json):
-    meta_matrix = init_numpy_array(input_json, 11, 'AccelData')
+    meta_matrix = init_numpy_array(input_json, 12, 'AccelData')
     for index, packet in enumerate(input_json[0]['AccelData']):
         meta_matrix[index, 0] = packet['Header']['dataSize']
         meta_matrix[index, 1] = packet['Header']['dataTypeSequence']
         meta_matrix[index, 2] = packet['Header']['systemTick']
         meta_matrix[index, 3] = packet['Header']['timestamp']['seconds']
+        # 4 will hold microloss
+        # 5 will hold macroloss
+        # 6 will hold coincidence of losses
         meta_matrix[index, 7] = index
         #  Each accelerometer packet has samples for 3 axes
         meta_matrix[index, 8] = 3
         meta_matrix[index, 9] = 8  # Number of samples in each channel always 8 for accel data
         meta_matrix[index, 10] = packet['SampleRate']
+        # 11 will hold future overlap
     
-    meta_matrix = correct_meta_matrix_consecutive_sys_tick(
-        meta_matrix, frameLength = 500)
+    meta_matrix = correct_meta_matrix_consecutive_sys_tick(meta_matrix)
     
     return meta_matrix
 
