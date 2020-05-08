@@ -1,0 +1,27 @@
+{
+    "remotePath": "/gpfs_home/YOUR_USERNAME/Github/rcsanalysis",
+    "host": "ssh.ccv.brown.edu",
+    "username": "YOUR_USERNAME",
+    "password": "YOUR_PASSWORD",
+    "port": 22,
+    "secure": true,
+    "protocol": "sftp",
+    "uploadOnSave": false,
+    "passive": false,
+    "debug": false,
+    "privateKeyPath": null,
+    "passphrase": null,
+    "agent": null,
+    "allow": [],
+    "ignore": [
+        "\\.vscode",
+        "\\.git",
+        "\\.DS_Store"
+    ],
+    "generatedFiles": {
+        "extensionsToInclude": [
+            ""
+        ],
+        "path": ""
+    }
+}
