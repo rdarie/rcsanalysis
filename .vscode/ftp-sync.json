@@ -2,7 +2,7 @@
     "remotePath": "/users/rdarie/Github/rcsanalysis",
     "host": "ssh.ccv.brown.edu",
     "username": "rdarie",
-    "password": "Monkey$2018",
+    "password": "Monkey$2020",
     "port": 22,
     "secure": true,
     "protocol": "sftp",
