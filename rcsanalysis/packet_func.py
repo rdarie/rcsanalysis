@@ -19,14 +19,11 @@ def strip_prog_name(x):
 
 def unpack_meta_matrix_time(meta_matrix, intersample_tick_count):
     # Initialize variables for looping:
-
     master_time = meta_matrix[0, 3]
     old_system_tick = 0
     running_tick_counter = 0
-
     firstSampleTick = np.zeros(meta_matrix.shape[0])
     lastSampleTick = np.zeros(meta_matrix.shape[0])
-    
     for packet_number, i in enumerate(meta_matrix):
         if i[5]:
             # We just suffered a macro packet loss...
@@ -50,11 +47,11 @@ def correct_meta_matrix_consecutive_sys_tick(
         meta_matrix, verbose=False):
     # correct issue described on page 64 of summit user manual
     metaMatrix = pd.DataFrame(
-        meta_matrix[:, [1, 2, -1]],
+        meta_matrix[:, [1, 2, 7]],
         columns=['dataTypeSequence', 'systemTick', 'packetIdx'])
     allFrameLengths = metaMatrix['systemTick'].diff()
     metaMatrix['rolloverGroup'] = (allFrameLengths < 0).cumsum()
-    #TODO access deviceLog to find what the nominal frame size actually is
+    # TODO access deviceLog to find what the nominal frame size actually is
     frameLength = allFrameLengths.value_counts().idxmax()
     for name, group in metaMatrix.groupby('rolloverGroup'):
         # duplicateSysTick = group.duplicated('systemTick')
@@ -79,25 +76,24 @@ def correct_meta_matrix_consecutive_sys_tick(
 
 
 def correct_meta_matrix_time_displacement(
-    meta_matrix, intersample_tick_count, verbose=False, plotting=False):
-    
+        meta_matrix, intersample_tick_count,
+        verbose=False, plotting=False):
     tdMeta = pd.DataFrame(
         meta_matrix[:, [1, 2, 3, 4, 5, 6, 9]],
         columns=[
             'dataTypeSequence', 'systemTick', 'masterClock',
             'microloss', 'macroloss', 'bothloss', 'packetSize']
         )
-
+    #
     firstSampleTick, lastSampleTick = unpack_meta_matrix_time(
         meta_matrix, intersample_tick_count)
     tdMeta['firstSampleTick'] = firstSampleTick
     tdMeta['lastSampleTick'] = lastSampleTick
-
     # how far is this packet from the preceding one
     tdMeta['sampleGap'] = tdMeta['firstSampleTick'].values - tdMeta['lastSampleTick'].shift(1).values
     # how much does this packet overlap the next one?
     tdMeta['sampleOverlap'] = tdMeta['lastSampleTick'].values - tdMeta['firstSampleTick'].shift(-1).values
-
+    #
     tdMeta['displacementDifference'] = (tdMeta['sampleGap'].values + tdMeta['sampleOverlap'].values) / 2
     tdMeta['packetsNotLost'] = ~(tdMeta['microloss'].astype(bool) | tdMeta['macroloss'].astype(bool))
     #
@@ -127,7 +123,6 @@ def correct_meta_matrix_time_displacement(
     correctedSysTicks = (
         nextGoodSysTicks.to_numpy() -
         nextGoodPacketSizes.to_numpy() * intersample_tick_count)
-    # pdb.set_trace()
     tdMeta.loc[packetsNeedFixing, 'systemTick'] = correctedSysTicks
     #print(tdMeta.loc[packetsNeedFixing, 'systemTick'])
     #print('difference in systicks is\n{}'.format(tdMeta.loc[packetsNeedFixing, 'systemTick'] - correctedSysTicks))
@@ -137,13 +132,12 @@ def correct_meta_matrix_time_displacement(
     # tdMeta.loc[packetsNeedFixing, 'systemTick'] = tdMeta.loc[
     #     packetsNeedFixing, 'systemTick'] - (round(correctiveValues) - intersample_tick_count)
     meta_matrix[:, 2] = tdMeta['systemTick'].values
-    #
     # meta_matrix[:, 11] = tdMeta['packetsOverlapFuture'].to_numpy()
     return meta_matrix, packetsNeedFixing
 
 
 def extract_td_meta_data(input_json):
-    meta_matrix = init_numpy_array(input_json, 12, 'TimeDomainData')
+    meta_matrix = init_numpy_array(input_json, 14, 'TimeDomainData')
     for index, packet in enumerate(input_json[0]['TimeDomainData']):
         meta_matrix[index, 0] = packet['Header']['dataSize']
         meta_matrix[index, 1] = packet['Header']['dataTypeSequence']
@@ -157,8 +151,15 @@ def extract_td_meta_data(input_json):
         meta_matrix[index, 9] = packet['Header']['dataSize'] / (2 * len(packet['ChannelSamples']))
         meta_matrix[index, 10] = packet['SampleRate']
         # 11 will hold future overlap
+        meta_matrix[index, 12] = packet['PacketRxUnixTime']
+    metaDF = pd.DataFrame(
+        meta_matrix[:, [1, 12]],
+        columns=['dataTypeSequence', 'PacketRxUnixTime'])
+    sortedIndices = metaDF.sort_values(
+        by=['PacketRxUnixTime', 'dataTypeSequence'],
+        kind='mergesort').index.to_numpy()
+    meta_matrix = meta_matrix[sortedIndices, :]
     meta_matrix = correct_meta_matrix_consecutive_sys_tick(meta_matrix)
-    
     return meta_matrix
 
 
@@ -372,12 +373,11 @@ def extract_stim_meta_data_events(input_json, trialSegment=None):
                     theseEventsDF = pd.concat(
                         [theseEventsDF, fillerDF],
                         ignore_index=True, sort=True)
-                #pdb.set_trace()
             eventsList.append(theseEventsDF)
     return pd.concat(eventsList, ignore_index=True, sort=True)
 
 def extract_accel_meta_data(input_json):
-    meta_matrix = init_numpy_array(input_json, 12, 'AccelData')
+    meta_matrix = init_numpy_array(input_json, 14, 'AccelData')
     for index, packet in enumerate(input_json[0]['AccelData']):
         meta_matrix[index, 0] = packet['Header']['dataSize']
         meta_matrix[index, 1] = packet['Header']['dataTypeSequence']
@@ -392,17 +392,30 @@ def extract_accel_meta_data(input_json):
         meta_matrix[index, 9] = 8  # Number of samples in each channel always 8 for accel data
         meta_matrix[index, 10] = packet['SampleRate']
         # 11 will hold future overlap
-    
+        meta_matrix[index, 12] = packet['PacketRxUnixTime']
+    metaDF = pd.DataFrame(
+        meta_matrix[:, [1, 12]],
+        columns=['dataTypeSequence', 'PacketRxUnixTime'])
+    sortedIndices = metaDF.sort_values(
+        by=['PacketRxUnixTime', 'dataTypeSequence'],
+        kind='mergesort').index.to_numpy()
+    meta_matrix[:, 13] = [
+        i
+        for i in range(meta_matrix.shape[0])]
+    meta_matrix = meta_matrix[sortedIndices, :]
+    #
     meta_matrix = correct_meta_matrix_consecutive_sys_tick(meta_matrix)
-    
+    #
     return meta_matrix
 
 
 def code_micro_and_macro_packet_loss(meta_matrix):
-    meta_matrix[np.where((np.diff(meta_matrix[:, 1]) % (2 ** 8)) > 1)[0] + 1, 4] = 1  # Top packet of microloss
-    meta_matrix[np.where((np.diff(meta_matrix[:, 3]) >= ((2 ** 16) * .0001)))[0] + 1, 5] = 1  # Top packet of macroloss
-    meta_matrix[:, 6] = ((meta_matrix[:, 4]).astype(int) & (meta_matrix[:, 5]).astype(
-        int))  # Code coincidence of micro and macro loss
+    meta_matrix[np.where((np.diff(meta_matrix[:, 1]) % (2 ** 8)) > 1)[0] + 1, 4] = 1  # Top packet of microloss; nonconsecutive dataTypeSequence
+    # meta_matrix[np.where((np.diff(meta_matrix[:, 3]) >= ((2 ** 16) * .0001)))[0] + 1, 5] = 1  # Top packet of macroloss; more than 6.5535 seconds apart
+    # TODO: the low res clock cannot resolve differences > 1 sec, so call anything > 6 a macroloss
+    # see UCSF code for how to handle this
+    meta_matrix[np.where((np.diff(meta_matrix[:, 3]) > 6))[0] + 1, 5] = 1  # Top packet of macroloss; more than 6. seconds apart
+    meta_matrix[:, 6] = ((meta_matrix[:, 4]).astype(int) & (meta_matrix[:, 5]).astype(int))  # Code coincidence of micro and macro loss
     return meta_matrix
 
 
@@ -440,47 +453,44 @@ def unpacker_td(meta_array, input_json, intersample_tick_count):
         raise ValueError('Number of Active Channels Changes Throughout the Recording')
     if np.diff(meta_array[:, 10]).sum():
         raise ValueError('Sampling Rate Changes Throughout the Recording')
-
     # Initialize array to hold output data
-    final_array = np.zeros((meta_array[:, 9].sum().astype(int), 3 + meta_array[0, 8].astype(int)))
-
+    final_array = np.zeros(
+        (
+            meta_array[:, 9].sum().astype(int),
+            4 + meta_array[0, 8].astype(int))
+            # 3 + meta_array[0, 8].astype(int))
+            )
     # Initialize variables for looping:
-
     array_bottom = 0
     master_time = meta_array[0, 3]
     old_system_tick = 0
     running_ms_counter = 0
-    for packet_number, i in enumerate(meta_array):
+    for sorted_packet_number, i in enumerate(meta_array):
+        packet_number = meta_array[sorted_packet_number, 7]
         if i[5]:
             # We just suffered a macro packet loss...
             old_system_tick = 0
             running_ms_counter = 0
             master_time = i[3]  # Resets the master time
-
         running_ms_counter += ((i[2] - old_system_tick) % (2 ** 16))
         backtrack_time = running_ms_counter - ((i[9] - 1) * intersample_tick_count)
-
         # Populate master clock time into array
         final_array[int(array_bottom):int(array_bottom + i[9]), 0] = np.array([master_time] * int(i[9]))
-
         # Linspace microsecond clock and populate into array
-        final_array[int(array_bottom):int(array_bottom + i[9]), 1] = np.linspace(backtrack_time, running_ms_counter,
-                                                                                 int(i[9]))
-
+        final_array[int(array_bottom):int(array_bottom + i[9]), 1] = np.linspace(
+            backtrack_time, running_ms_counter, int(i[9]))
+        # Populate coarse clock time into array
+        final_array[int(array_bottom):int(array_bottom + i[9]), -2] = np.array([i[3]] * int(i[9]))
         # Put packet number into array for debugging
-        final_array[int(array_bottom):int(array_bottom + i[9]), -1] = np.array([packet_number] * int(i[9]))
-
+        final_array[int(array_bottom):int(array_bottom + i[9]), -1] = np.array([sorted_packet_number] * int(i[9]))
         # Unpack timedomain data from original packets into array
         for j in range(0, int(i[8])):
             final_array[int(array_bottom):int(array_bottom + i[9]), j + 2] = \
             input_json[0]['TimeDomainData'][int(i[7])]['ChannelSamples'][j]['Value']
-
         # Update counters for next loop
         old_system_tick = i[2]
         array_bottom += i[9]
-
     # Convert systemTick into microseconds
-
     final_array[:, 1] = final_array[:, 1] * 100
     return final_array
 
@@ -491,62 +501,56 @@ def unpacker_accel(meta_array, input_json, intersample_tick_count):
         raise ValueError('Number of Active Channels Changes Throughout the Recording')
     if np.diff(meta_array[:, 10]).sum():
         raise ValueError('Sampling Rate Changes Throughout the Recording')
-
     # Initialize array to hold output data
-    final_array = np.zeros((meta_array[:, 9].sum().astype(int), 3 + meta_array[0, 8].astype(int)))
-
+    final_array = np.zeros(
+        (
+            meta_array[:, 9].sum().astype(int),
+            4 + meta_array[0, 8].astype(int))
+            # 3 + meta_array[0, 8].astype(int))
+            )
     # Initialize variables for looping:
-
     array_bottom = 0
     master_time = meta_array[0, 3]
     old_system_tick = 0
     running_ms_counter = 0
-    for packet_number, i in enumerate(meta_array):
+    for sorted_packet_number, i in enumerate(meta_array):
+        packet_number = meta_array[sorted_packet_number, 7]
         if i[5]:
             # We just suffered a macro packet loss...
             old_system_tick = 0
             running_ms_counter = 0
             master_time = i[3]  # Resets the master time
-
         running_ms_counter += ((i[2] - old_system_tick) % (2 ** 16))
         backtrack_time = running_ms_counter - ((i[9] - 1) * intersample_tick_count)
-
         # Populate master clock time into array
         final_array[int(array_bottom):int(array_bottom + i[9]), 0] = np.array([master_time] * int(i[9]))
-
         # Linspace microsecond clock and populate into array
-        final_array[int(array_bottom):int(array_bottom + i[9]), 1] = np.linspace(backtrack_time, running_ms_counter,
-                                                                                 int(i[9]))
-
+        final_array[int(array_bottom):int(array_bottom + i[9]), 1] = np.linspace(
+            backtrack_time, running_ms_counter, int(i[9]))
+        # Populate coarse clock time into array
+        final_array[int(array_bottom):int(array_bottom + i[9]), -2] = np.array([i[3]] * int(i[9]))
         # Put packet number into array for debugging
-        final_array[int(array_bottom):int(array_bottom + i[9]), -1] = np.array([packet_number] * int(i[9]))
-
+        final_array[int(array_bottom):int(array_bottom + i[9]), -1] = np.array([sorted_packet_number] * int(i[9]))
         # Unpack timedomain data from original packets into array
         for accel_index, accel_channel in enumerate(['XSamples', 'YSamples', 'ZSamples']):
             final_array[int(array_bottom):int(array_bottom + i[9]), accel_index + 2] = \
             input_json[0]['AccelData'][int(i[7])][accel_channel]
-
         # Update counters for next loop
         old_system_tick = i[2]
         array_bottom += i[9]
-
     # Convert systemTick into microseconds
-
     final_array[:, 1] = final_array[:, 1] * 100
     return final_array
 
 def save_to_disk(data_matrix, filename_str, time_format, data_type, num_cols=None):
     # TODO: We need to find a different way of dynamically naming columns. Current method won't work.
-    
     if num_cols is None:
         num_cols = data_matrix.shape[1]
-        
     if data_type == 'accel':
         channel_names = ['accel_' + x for x in ['x', 'y', 'z']] # None of his channel name stuff works.
     else:
         channel_names = ['channel_' + str(x) for x in range(0, num_cols)]
-
-    column_names = ['time_master', 'microseconds'] + channel_names + ['packetIdx']
+    column_names = ['time_master', 'microseconds'] + channel_names + ['coarseClock', 'packetIdx']
     df = pd.DataFrame(data_matrix, columns=column_names)
     if time_format == 'full':
         df.time_master = pd.to_datetime(df.time_master, unit='s', origin=pd.Timestamp('2000-03-01'))
