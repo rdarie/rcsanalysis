@@ -3,11 +3,18 @@ import pandas as pd
 import seaborn as sns
 from matplotlib import pyplot as plt
 import pdb
+import traceback
 """ All the Code Below Is For the Second Generation Packetizer """
 
 progAmpNames = ['program{}_amplitude'.format(progIdx) for progIdx in range(4)]
 progPWNames = ['program{}_pw'.format(progIdx) for progIdx in range(4)]
 groupConfigNames = ['TherapyConfigGroup{}'.format(grpIdx) for grpIdx in range(4)]
+metaMatrixColumns = [
+    'dataSize', 'dataTypeSequence',
+    'systemTick', 'timestamp', 'microloss', 'macroloss', 'bothloss',
+    'packetIdx', 'chanSamplesLen', 'dataSizePerChannel', 'SampleRate',
+    'PacketGenTime', 'PacketRxUnixTime',
+    'firstSampleTick', 'lastSampleTick', 'globalSequence', 'skipPacket']
 
 def init_numpy_array(input_json, num_cols, data_type):
     num_rows = len(input_json[0][data_type])
@@ -17,10 +24,18 @@ def init_numpy_array(input_json, num_cols, data_type):
 def strip_prog_name(x):
     return int(x.split('program')[-1].split('_')[0])
 
-def unpack_meta_matrix_time(meta_matrix, intersample_tick_count):
+def unpack_meta_matrix_time(
+        meta_matrix, intersample_tick_count, usePacketGenTime=True):
     # Initialize variables for looping:
     master_time = meta_matrix[0, 3]
     prev_master_time = meta_matrix[0, 3]
+    # packet GEN time
+    pGenT = meta_matrix[0, 11]
+    prev_pGenT = meta_matrix[0, 11]
+    # packet RX time
+    pRxT = meta_matrix[0, 12]
+    prev_pRxT = meta_matrix[0, 12]
+    #
     old_system_tick = 0
     running_tick_counter = 0
     firstSampleTick = np.zeros(meta_matrix.shape[0])
@@ -29,22 +44,41 @@ def unpack_meta_matrix_time(meta_matrix, intersample_tick_count):
     resolvedMacroloss = True
     for packet_number, i in enumerate(meta_matrix):
         # packet_number = meta_matrix[sorted_packet_number, 7]
+        if i[16]:
+            # if instructed to toss
+            continue
         master_time = i[3]  # Resets the master time
+        pGenT = i[11]  # Resets the packet gen time
+        pRxT = i[12]  # Resets the packet rx time
         if i[5] or (not resolvedMacroloss):
             # We just suffered a macro packet loss...
             print('meta matrix: adding time to the running counter')
-            min_gap = (master_time - (prev_master_time + 1))
-            max_gap = min_gap + 2
-            min_n_rollovers = np.floor(min_gap / ((2 ** 16) * 10 ** -4))
-            max_n_rollovers = np.floor(max_gap / ((2 ** 16) * 10 ** -4))
-            if min_n_rollovers == max_n_rollovers:
+            if usePacketGenTime:
                 resolvedMacroloss = True
                 print('     resolved')
-                running_tick_counter += min_n_rollovers * 2 ** 16
+                # msk = meta_matrix[:, 11] > 0
+                # plt.plot(meta_matrix[msk, 11]); plt.show()
+                # plt.plot(np.diff(meta_matrix[:, 3])); plt.show()
+                # plt.plot(np.diff(meta_matrix[:, 12])); plt.show()
+                if ~((pGenT < 0) or (prev_pGenT<0)):
+                    gap = pGenT - prev_pGenT  # in msec
+                else:
+                    gap = pRxT - prev_pRxT # in msec
+                n_rollovers = np.floor(gap / ((2 ** 16) * 10 ** -1))
+                running_tick_counter += n_rollovers * 2 ** 16
             else:
-                unresolvedMacrolossIdx.append(packet_number)
-                resolvedMacroloss = False
-                print('   unresolved')
+                min_gap = (master_time - (prev_master_time + 1))
+                max_gap = min_gap + 2
+                min_n_rollovers = np.floor(min_gap / ((2 ** 16) * 10 ** -4))
+                max_n_rollovers = np.floor(max_gap / ((2 ** 16) * 10 ** -4))
+                if min_n_rollovers == max_n_rollovers:
+                    resolvedMacroloss = True
+                    print('     resolved')
+                    running_tick_counter += min_n_rollovers * 2 ** 16
+                else:
+                    unresolvedMacrolossIdx.append(packet_number)
+                    resolvedMacroloss = False
+                    print('   unresolved')
             # old_system_tick = 0
             # running_tick_counter = 0
         if resolvedMacroloss:
@@ -58,7 +92,9 @@ def unpack_meta_matrix_time(meta_matrix, intersample_tick_count):
             # Update counters for next loop
             old_system_tick = curr_system_tick
             prev_master_time = master_time
-    # pdb.set_trace()
+            prev_pGenT = pGenT
+            prev_pRxT = pRxT
+    #
     for packet_number in unresolvedMacrolossIdx[::-1]:
         curr_system_tick = meta_matrix[packet_number, 2]
         next_system_tick = meta_matrix[packet_number + 1, 2]
@@ -67,21 +103,23 @@ def unpack_meta_matrix_time(meta_matrix, intersample_tick_count):
         firstSampleTick[packet_number] = (
             lastSampleTick[packet_number] -
             ((meta_matrix[packet_number, 9] - 1) * intersample_tick_count))
-    meta_matrix[:, 13] = lastSampleTick
-    meta_matrix[:, 14] = firstSampleTick
+    meta_matrix[:, 13] = firstSampleTick
+    meta_matrix[:, 14] = lastSampleTick
     return meta_matrix
 
 
 def correct_meta_matrix_consecutive_sys_tick(
-        meta_matrix, verbose=False):
+        meta_matrix, intersampleTickCount=None, frameLength=None, verbose=False):
     # correct issue described on page 64 of summit user manual
-    metaMatrix = pd.DataFrame(
-        meta_matrix[:, [1, 2, 7]],
-        columns=['dataTypeSequence', 'systemTick', 'packetIdx'])
-    allFrameLengths = metaMatrix['systemTick'].diff()
-    metaMatrix['rolloverGroup'] = (allFrameLengths < 0).cumsum()
+    metaMatrix = pd.DataFrame(meta_matrix, columns=metaMatrixColumns)
+    sysTickDiff = metaMatrix['systemTick'].diff()
+    tsDiff = metaMatrix['timestamp'].diff()
+    metaMatrix['rolloverGroup'] = ((sysTickDiff < 0) | (tsDiff > 6)).cumsum()
     # TODO access deviceLog to find what the nominal frame size actually is
-    frameLength = allFrameLengths.value_counts().idxmax()
+    if frameLength is None:
+        nominalFrameSize = metaMatrix['dataSizePerChannel'].value_counts().idxmax()
+        frameLength = nominalFrameSize * intersampleTickCount
+    packetsNeedFixing = []
     for name, group in metaMatrix.groupby('rolloverGroup'):
         # duplicateSysTick = group.duplicated('systemTick')
         duplicateSysTick = group['systemTick'].diff() == 0
@@ -90,18 +128,22 @@ def correct_meta_matrix_consecutive_sys_tick(
             for duplicateIdx in duplicateIdxs:
                 sysTickVal = group.loc[duplicateIdx, 'systemTick']
                 allOccurences = group.loc[group['systemTick'] == sysTickVal, :]
-                assert len(allOccurences) == 2
+                try:
+                    assert len(allOccurences) == 2
+                except:
+                    pdb.set_trace()
                 #  'dataTypeSequence' rolls over, correct for it
                 specialCase = (
                     (allOccurences['dataTypeSequence'] == 255).any() &
                     (allOccurences['dataTypeSequence'] == 0).any()
                 )
                 if specialCase:
-                    idxNeedsChanging = allOccurences['dataTypeSequence'].idxmax()
+                    idxNeedsChanging = allOccurences['dataTypeSequence'].astype(np.int).idxmax()
                 else:
-                    idxNeedsChanging = allOccurences['dataTypeSequence'].idxmin()
+                    idxNeedsChanging = allOccurences['dataTypeSequence'].astype(np.int).idxmin()
+                packetsNeedFixing.append(idxNeedsChanging)
                 meta_matrix[idxNeedsChanging, 2] = meta_matrix[idxNeedsChanging, 2] - frameLength
-    return meta_matrix
+    return meta_matrix, packetsNeedFixing
 
 
 def correct_meta_matrix_time_displacement(
@@ -166,8 +208,179 @@ def correct_meta_matrix_time_displacement(
     return meta_matrix, packetsNeedFixing
 
 
-def extract_td_meta_data(input_json, sampleRateLookupDict):
-    meta_matrix = init_numpy_array(input_json, 15, 'TimeDomainData')
+def process_meta_data(
+        meta_matrix, sampleRateLookupDict=None,
+        intersampleTickCount=None, plotting=False, fixPacketGenTime=True):
+    metaDF = pd.DataFrame(meta_matrix, columns=metaMatrixColumns)
+    #
+    metaDF.sort_values(
+        by=['PacketRxUnixTime', 'dataTypeSequence'],
+        kind='mergesort', inplace=True)
+    metaDF.reset_index(drop=True, inplace=True)
+    #
+    if fixPacketGenTime:
+        noGenTimeMask = metaDF['PacketGenTime'] < 0
+        metaDF.loc[noGenTimeMask, 'PacketGenTime'] = np.nan
+    #
+    if plotting:
+        rxTDiff = metaDF['PacketRxUnixTime'].diff()
+        fig, ax = plt.subplots(4, 1, sharex=True, figsize=(15, 15))
+        twinAx = []
+        # ax[0] checks for need to sort
+        p0, = ax[0].plot(
+            rxTDiff.index, rxTDiff,
+            label='RX time diff (msec)')
+        rxTAx = ax[0].twinx()
+        twinAx.append(rxTAx)
+        twinP0, = rxTAx.plot(
+            metaDF.index, metaDF['PacketRxUnixTime'], 'c',
+            label='RX time (msec)')
+        rxTAx.plot(
+            metaDF.index[noGenTimeMask],
+            metaDF.loc[noGenTimeMask, 'PacketRxUnixTime'],
+            'y*', label='Packet Gen Time < 0 (missing)')
+        rxTAx.set_ylabel('RX time (msec)')
+        rxTAx.legend(loc='lower right')
+        rxTAx.yaxis.get_label().set_color(twinP0.get_color())
+        # ax[1] deals with PacketGenTime
+        actualLatency = metaDF['PacketRxUnixTime'] - metaDF['PacketGenTime']
+        p1, = ax[1].plot(
+            metaDF.index, actualLatency,
+            label='Rx - Gen')
+        # ax[2] deals with dataTypeSeq
+        dtsDiff = metaDF['dataTypeSequence'].diff()
+        dtsAx = ax[2].twinx()
+        twinAx.append(dtsAx)
+        twinP2, = dtsAx.plot(
+            metaDF.index, metaDF['dataTypeSequence'], 'c',
+            label='dataTypeSequence')
+        p2, = ax[2].plot(
+            dtsDiff.index, dtsDiff, '-o',
+            label='dataTypeSequence diff (excluding 255)')
+        ax[2].set_title('dataTypeSequence')
+        ax[2].set_ylim(
+            dtsDiff[dtsDiff > -255].min() - 1,
+            dtsDiff[dtsDiff > -255].max() + 1,
+            )
+        # ax[3] deals with globalSeq
+        # ax[3].plot(metaDF.index, metaDF['globalSequence'])
+        # gsDiff = metaDF['globalSequence'].diff()
+        # gsDiffAx = ax[3].twinx()
+        # gsDiffAx.plot(gsDiff.index, gsDiff, 'c')
+        # plt.show()
+        # ax[3] deals with timestamp
+        tsDiff = metaDF['timestamp'].diff()
+        p3, = ax[3].plot(
+            tsDiff.index,
+            tsDiff, label='timestamp diff')
+        tsAx = ax[3].twinx()
+        twinAx.append(tsAx)
+        twinP3, = tsAx.plot(
+            metaDF.index, metaDF['timestamp'], 'c',
+            label='timestamp')
+    else:
+        fig, ax, twinAx = None, None, None
+    #
+    if fixPacketGenTime:
+        latency = metaDF['PacketRxUnixTime'] - metaDF['PacketGenTime']
+        latency = (
+            latency
+            .rolling(50, min_periods=10, center=True)
+            .apply(lambda x : np.nanmean(x), raw=True))
+        metaDF.loc[noGenTimeMask, 'PacketGenTime'] = (
+            metaDF.loc[noGenTimeMask, 'PacketRxUnixTime'] -
+            latency.loc[noGenTimeMask])
+    #
+    tsDropMask = (metaDF['timestamp'].diff() < 0)
+    metaDF.loc[:, 'skipPacket'] = tsDropMask.to_numpy()
+    if plotting:
+        tsAx.plot(
+            metaDF.index[tsDropMask],
+            metaDF.loc[tsDropMask, 'timestamp'],
+            'r*', label='dropped bc. of timestamp')
+    metaDF = metaDF.loc[~metaDF['skipPacket'], :]
+    metaDF.reset_index(drop=True, inplace=True)
+    #
+    if intersampleTickCount is None:
+        mostCommonSampleRateCode = metaDF['SampleRate'].value_counts().idxmax()
+        fs = float(sampleRateLookupDict[mostCommonSampleRateCode])
+        intersampleTickCount = (fs ** -1) / (100e-6)
+    #
+    metaDF.iloc[:, :], packetsNeedFixing = correct_meta_matrix_consecutive_sys_tick(
+        metaDF.to_numpy(), intersampleTickCount=intersampleTickCount)
+    if plotting:
+        dtsAx.plot(
+            metaDF.index[packetsNeedFixing],
+            metaDF['dataTypeSequence'].iloc[packetsNeedFixing],
+            'g*', label='equal consecutive system ticks')
+    metaDF.iloc[:, :] = code_micro_and_macro_packet_loss(metaDF.to_numpy())
+    #
+    metaDF.iloc[:, :] = unpack_meta_matrix_time(metaDF.to_numpy(), intersampleTickCount)
+    #
+    if plotting:
+        ax[0].set_ylabel('RX diff (msec)')
+        ax[0].set_title('RX Time')
+        ax[0].yaxis.get_label().set_color(p0.get_color())
+        ax[0].legend(loc='upper right')
+        #
+        ax[1].set_title('RxTime - GenTime')
+        ax[1].set_ylabel('(msec)')
+        ax[1].yaxis.get_label().set_color(p1.get_color())
+        ax[1].legend()
+        #
+        ax[2].legend(loc='upper right')
+        ax[2].set_ylabel('(count)')
+        ax[2].yaxis.get_label().set_color(p2.get_color())
+        dtsAx.set_ylabel('(count)')
+        dtsAx.yaxis.get_label().set_color(twinP2.get_color())
+        dtsAx.legend(loc='lower right')
+        #
+        ax[3].set_title('timestamp')
+        ax[3].set_xlabel('Packet #')
+        ax[3].legend(loc='upper right')
+        ax[3].set_ylabel('sec')
+        ax[3].yaxis.get_label().set_color(p3.get_color())
+        tsAx.set_ylabel('sec')
+        tsAx.yaxis.get_label().set_color(twinP3.get_color())
+        tsAx.legend(loc='lower right')
+    return metaDF.to_numpy(), fig, ax, twinAx
+
+
+def extract_accel_meta_data(
+        input_json, sampleRateLookupDict=None,
+        intersampleTickCount=None, plotting=False, fixPacketGenTime=True):
+    meta_matrix = init_numpy_array(input_json, 17, 'AccelData')
+    for index, packet in enumerate(input_json[0]['AccelData']):
+        meta_matrix[index, 0] = packet['Header']['dataSize']
+        meta_matrix[index, 1] = packet['Header']['dataTypeSequence']
+        meta_matrix[index, 2] = packet['Header']['systemTick']
+        meta_matrix[index, 3] = packet['Header']['timestamp']['seconds']
+        # 4 will hold microloss
+        # 5 will hold macroloss
+        # 6 will hold coincidence of losses
+        meta_matrix[index, 7] = index
+        #  Each accelerometer packet has samples for 3 axes
+        meta_matrix[index, 8] = 3
+        assert ((len(packet['XSamples']) == len(packet['YSamples'])) & (len(packet['XSamples']) == len(packet['ZSamples'])))
+        meta_matrix[index, 9] = len(packet['XSamples']) # Number of samples in each channel always 8 for accel data
+        meta_matrix[index, 10] = packet['SampleRate']
+        meta_matrix[index, 11] = packet['PacketGenTime']
+        meta_matrix[index, 12] = packet['PacketRxUnixTime']
+        # 13 will hold first sampleTick
+        # 14 will hold last sampleTick
+        meta_matrix[index, 15] = packet['Header']['globalSequence']
+        meta_matrix[index, 16] = False # 16 will hold instruction to skip
+    meta_matrix, fig, ax, twinAx = process_meta_data(
+        meta_matrix, sampleRateLookupDict=sampleRateLookupDict,
+        intersampleTickCount=intersampleTickCount, plotting=plotting,
+        fixPacketGenTime=fixPacketGenTime)
+    return meta_matrix, fig, ax, twinAx
+
+
+def extract_td_meta_data(
+        input_json, sampleRateLookupDict=None,
+        intersampleTickCount=None, plotting=False, fixPacketGenTime=True):
+    meta_matrix = init_numpy_array(input_json, 17, 'TimeDomainData')
     for index, packet in enumerate(input_json[0]['TimeDomainData']):
         meta_matrix[index, 0] = packet['Header']['dataSize']
         meta_matrix[index, 1] = packet['Header']['dataTypeSequence']
@@ -180,41 +393,33 @@ def extract_td_meta_data(input_json, sampleRateLookupDict):
         meta_matrix[index, 8] = len(packet['ChannelSamples'])
         meta_matrix[index, 9] = packet['Header']['dataSize'] / (2 * len(packet['ChannelSamples']))
         meta_matrix[index, 10] = packet['SampleRate']
-        # 11 will hold future overlap
+        meta_matrix[index, 11] = packet['PacketGenTime']
         meta_matrix[index, 12] = packet['PacketRxUnixTime']
-    metaDF = pd.DataFrame(
-        meta_matrix[:, [1, 10, 12]],
-        columns=['dataTypeSequence', 'SampleRate', 'PacketRxUnixTime'])
-    sortedIndices = metaDF.sort_values(
-        by=['PacketRxUnixTime', 'dataTypeSequence'],
-        kind='mergesort').index.to_numpy()
-    meta_matrix = meta_matrix[sortedIndices, :]
-    #
-    meta_matrix = correct_meta_matrix_consecutive_sys_tick(meta_matrix)
-    meta_matrix = code_micro_and_macro_packet_loss(meta_matrix)
-    #
-    mostCommonSampleRateCode = metaDF['SampleRate'].value_counts().idxmax()
-    fs = float(sampleRateLookupDict[mostCommonSampleRateCode])
-    intersampleTickCount = (fs ** -1) / (100e-6)
-    meta_matrix = unpack_meta_matrix_time(meta_matrix, intersampleTickCount)
-    return meta_matrix
+        # 13 will hold first sampleTick
+        # 14 will hold last sampleTick
+        meta_matrix[index, 15] = packet['Header']['globalSequence']
+        meta_matrix[index, 16] = False # 16 will hold instruction to skip
+    meta_matrix, fig, ax, twinAx = process_meta_data(
+        meta_matrix, sampleRateLookupDict=sampleRateLookupDict,
+        intersampleTickCount=intersampleTickCount, plotting=plotting,
+        fixPacketGenTime=fixPacketGenTime)
+    return meta_matrix, fig, ax, twinAx
 
 
 def extract_time_sync_meta_data(input_json):
     timeSync = input_json['TimeSyncData']
-
     timeSyncData = pd.DataFrame(
         columns=[
             'HostUnixTime', 'PacketGenTime', 'LatencyMilliseconds',
             'dataSize', 'dataType', 'dataTypeSequence', 'globalSequence',
             'systemTick', 'timestamp', 'microloss', 'macroloss', 'bothloss',
-            'microseconds', 'time_master'
+            'firstSampleTick', 'lastSampleTick', 'skipPacket'
             ]
         )
     for index, packet in enumerate(timeSync):
         if packet['LatencyMilliseconds'] > 0:
             entryData = {
-                'HostUnixTime': packet['PacketRxUnixTime'],
+                'PacketRxUnixTime': packet['PacketRxUnixTime'],
                 'PacketGenTime': packet['PacketGenTime'],
                 'LatencyMilliseconds': packet['LatencyMilliseconds'],
                 'dataSize': packet['Header']['dataSize'],
@@ -225,50 +430,30 @@ def extract_time_sync_meta_data(input_json):
                 'timestamp': packet['Header']['timestamp']['seconds'],
                 'packetIdx': index,
                 'microloss': 0, 'macroloss': 0, 'bothloss': 0,
-                'microseconds': 0, 'time_master': np.nan
+                'skipPacket': False,
+                # 'microseconds': 0,
+                # 'time_master': np.nan
                 }
             entrySeries = pd.Series(entryData)
             timeSyncData = timeSyncData.append(
                 entrySeries, ignore_index=True, sort=True)
-    timeSyncData = timeSyncData[[
-            'dataSize', 'dataTypeSequence', 'systemTick', 'timestamp',
-            'microloss', 'macroloss', 'bothloss',
-            'packetIdx', 'HostUnixTime',
-            'PacketGenTime', 'LatencyMilliseconds',
-            'dataType', 'globalSequence', 'time_master'
-        ]]
-    timeSyncData.iloc[:, :] = correct_meta_matrix_consecutive_sys_tick(
-        timeSyncData.values)
-    timeSyncData.iloc[:, :] = code_micro_and_macro_packet_loss(
-        timeSyncData.values)
-    old_system_tick = 0
-    running_tick_counter = 0
-    master_time = timeSyncData['timestamp'].iloc[0]
-    prev_master_time = timeSyncData['timestamp'].iloc[0]
-    reference_time = timeSyncData['timestamp'].iloc[0]
-    for index, packet in timeSyncData.iterrows():
-        master_time = packet['timestamp']  # Resets the master time
-        if packet['macroloss']:
-            # We just suffered a macro packet loss...
-            print('time sync parser, resolving macroloss')
-            min_gap = (master_time - (prev_master_time + 1))
-            max_gap = min_gap + 2
-            min_n_rollovers = np.floor(min_gap / ((2 ** 16) * 10 ** -4))
-            max_n_rollovers = np.floor(max_gap / ((2 ** 16) * 10 ** -4))
-            if min_n_rollovers == max_n_rollovers:
-                running_tick_counter += min_n_rollovers * (2 ** 16)
-            else:
-                pdb.set_trace()
-            # old_system_tick = 0
-            # running_tick_counter = 0
-        running_tick_counter += (
-            (packet['systemTick'] - old_system_tick) % (2 ** 16))
-        timeSyncData.loc[index, 'microseconds'] = running_tick_counter * 100
-        timeSyncData.loc[index, 'time_master'] = reference_time
-        # Update counters for next loop
-        old_system_tick = packet['systemTick']
-        prev_master_time = master_time
-        
+    #
+    timeSyncData = timeSyncData.reindex(columns=metaMatrixColumns + ['LatencyMilliseconds'])
+    sortedIndices = timeSyncData.sort_values(
+        by=['PacketRxUnixTime', 'dataTypeSequence'],
+        kind='mergesort').index.to_numpy()
+    timeSyncData = timeSyncData.iloc[sortedIndices, :].reset_index(drop=True)
+    #
+    timeSyncData.loc[:, metaMatrixColumns], packetsNeedFixing = correct_meta_matrix_consecutive_sys_tick(
+        timeSyncData.loc[:, metaMatrixColumns].to_numpy(), frameLength=1e4)
+    timeSyncData.loc[:, metaMatrixColumns] = code_micro_and_macro_packet_loss(
+        timeSyncData.loc[:, metaMatrixColumns].to_numpy())
+    timeSyncData.loc[:, metaMatrixColumns] = unpack_meta_matrix_time(
+        timeSyncData.loc[:, metaMatrixColumns].to_numpy(), 0)
+    #
+    timeSyncData.loc[:, 'HostUnixTime'] = timeSyncData.loc[:, 'PacketRxUnixTime']
+    timeSyncData.loc[:, 'microseconds'] = timeSyncData.loc[:, 'lastSampleTick'] * 100
+    timeSyncData.loc[:, 'time_master'] = timeSyncData['timestamp'].iloc[0]
     timeSyncData['time_master'] = pd.to_datetime(
         timeSyncData['time_master'], unit='s', origin=pd.Timestamp('2000-03-01'))
     timeSyncData['microseconds'] = pd.to_timedelta(
@@ -424,48 +609,13 @@ def extract_stim_meta_data_events(input_json, trialSegment=None):
             eventsList.append(theseEventsDF)
     return pd.concat(eventsList, ignore_index=True, sort=True)
 
-def extract_accel_meta_data(input_json, sampleRateLookupDict):
-    meta_matrix = init_numpy_array(input_json, 15, 'AccelData')
-    for index, packet in enumerate(input_json[0]['AccelData']):
-        meta_matrix[index, 0] = packet['Header']['dataSize']
-        meta_matrix[index, 1] = packet['Header']['dataTypeSequence']
-        meta_matrix[index, 2] = packet['Header']['systemTick']
-        meta_matrix[index, 3] = packet['Header']['timestamp']['seconds']
-        # 4 will hold microloss
-        # 5 will hold macroloss
-        # 6 will hold coincidence of losses
-        meta_matrix[index, 7] = index
-        #  Each accelerometer packet has samples for 3 axes
-        meta_matrix[index, 8] = 3
-        meta_matrix[index, 9] = 8  # Number of samples in each channel always 8 for accel data
-        meta_matrix[index, 10] = packet['SampleRate']
-        # 11 will hold future overlap
-        meta_matrix[index, 12] = packet['PacketRxUnixTime']
-    metaDF = pd.DataFrame(
-        meta_matrix[:, [1, 10, 12]],
-        columns=['dataTypeSequence', 'SampleRate', 'PacketRxUnixTime'])
-    sortedIndices = metaDF.sort_values(
-        by=['PacketRxUnixTime', 'dataTypeSequence'],
-        kind='mergesort').index.to_numpy()
-    meta_matrix = meta_matrix[sortedIndices, :]
-    #
-    meta_matrix = correct_meta_matrix_consecutive_sys_tick(meta_matrix)
-    meta_matrix = code_micro_and_macro_packet_loss(meta_matrix)
-    #
-    mostCommonSampleRateCode = metaDF['SampleRate'].value_counts().idxmax()
-    fs = float(sampleRateLookupDict[mostCommonSampleRateCode])
-    intersampleTickCount = (fs ** -1) / (100e-6)
-    meta_matrix = unpack_meta_matrix_time(meta_matrix, intersampleTickCount)
-    #
-    return meta_matrix
-
-
 def code_micro_and_macro_packet_loss(meta_matrix):
     meta_matrix[np.where((np.diff(meta_matrix[:, 1]) % (2 ** 8)) > 1)[0] + 1, 4] = 1  # Top packet of microloss; nonconsecutive dataTypeSequence
     # meta_matrix[np.where((np.diff(meta_matrix[:, 3]) >= ((2 ** 16) * .0001)))[0] + 1, 5] = 1  # Top packet of macroloss; more than 6.5535 seconds apart
     # TODO: the low res clock cannot resolve differences > 1 sec, so call anything > 6 a macroloss
     # see UCSF code for how to handle this
-    meta_matrix[np.where((np.diff(meta_matrix[:, 3]) >= 6))[0] + 1, 5] = 1  # Top packet of macroloss; more than 6. seconds apart
+    # meta_matrix[np.where((np.diff(meta_matrix[:, 3]) >= 6))[0] + 1, 5] = 1  # Top packet of macroloss; more than 6. seconds apart
+    meta_matrix[np.where((np.diff(meta_matrix[:, 12]) >= 6e3))[0] + 1, 5] = 1  # Top packet of macroloss; more than 6. seconds apart
     meta_matrix[:, 6] = ((meta_matrix[:, 4]).astype(int) & (meta_matrix[:, 5]).astype(int))  # Code coincidence of micro and macro loss
     return meta_matrix
 
@@ -505,35 +655,20 @@ def unpacker_td(meta_matrix, input_json, intersample_tick_count):
     if np.diff(meta_matrix[:, 10]).sum():
         raise ValueError('Sampling Rate Changes Throughout the Recording')
     # Initialize array to hold output data
+    keepMask = ~meta_matrix[:, 16].astype(np.bool)
     final_array = np.zeros(
         (
-            meta_matrix[:, 9].sum().astype(int),
-            4 + meta_matrix[0, 8].astype(int))
+            int(meta_matrix[keepMask, 9].sum()),
+            int(4 + meta_matrix[0, 8]))
             # 3 + meta_matrix[0, 8].astype(int))
             )
     # Initialize variables for looping:
     array_bottom = 0
     reference_time = meta_matrix[0, 3]
-    master_time = meta_matrix[0, 3]
-    prev_master_time = meta_matrix[0, 3]
-    old_system_tick = 0
-    running_tick_counter = 0
-    for sorted_packet_number, i in enumerate(meta_matrix):
-        master_time = i[3]  # Resets the master time
-        if i[5]:
-            # We just suffered a macro packet loss...
-            print('unpacker_td, resolving macroloss')
-            min_gap = (master_time - (prev_master_time + 1))
-            max_gap = min_gap + 2
-            min_n_rollovers = np.floor(min_gap / ((2 ** 16) * 10 ** -4))
-            max_n_rollovers = np.floor(max_gap / ((2 ** 16) * 10 ** -4))
-            if min_n_rollovers == max_n_rollovers:
-                running_tick_counter += min_n_rollovers * 2 ** 16
-            else:
-                pdb.set_trace()
-            # old_system_tick = 0
-            # running_tick_counter = 0
-        running_tick_counter += ((i[2] - old_system_tick) % (2 ** 16))
+    for packet_number, i in enumerate(meta_matrix):
+        if i[16]:
+            continue
+        running_tick_counter = i[14]
         backtrack_time = running_tick_counter - ((i[9] - 1) * intersample_tick_count)
         # Populate master clock time into array
         final_array[int(array_bottom):int(array_bottom + i[9]), 0] = np.array([reference_time] * int(i[9]))
@@ -543,14 +678,12 @@ def unpacker_td(meta_matrix, input_json, intersample_tick_count):
         # Populate coarse clock time into array
         final_array[int(array_bottom):int(array_bottom + i[9]), -2] = np.array([reference_time] * int(i[9]))
         # Put packet number into array for debugging
-        final_array[int(array_bottom):int(array_bottom + i[9]), -1] = np.array([sorted_packet_number] * int(i[9]))
+        final_array[int(array_bottom):int(array_bottom + i[9]), -1] = np.array([packet_number] * int(i[9]))
         # Unpack timedomain data from original packets into array
         for j in range(0, int(i[8])):
             final_array[int(array_bottom):int(array_bottom + i[9]), j + 2] = \
             input_json[0]['TimeDomainData'][int(i[7])]['ChannelSamples'][j]['Value']
         # Update counters for next loop
-        old_system_tick = i[2]
-        prev_master_time = i[3]
         array_bottom += i[9]
     # Convert systemTick into microseconds
     final_array[:, 1] = final_array[:, 1] * 100
@@ -564,36 +697,20 @@ def unpacker_accel(meta_matrix, input_json, intersample_tick_count):
     if np.diff(meta_matrix[:, 10]).sum():
         raise ValueError('Sampling Rate Changes Throughout the Recording')
     # Initialize array to hold output data
+    keepMask = ~meta_matrix[:, 16].astype(np.bool)
     final_array = np.zeros(
         (
-            meta_matrix[:, 9].sum().astype(int),
-            4 + meta_matrix[0, 8].astype(int))
+            int(meta_matrix[keepMask, 9].sum()),
+            int(4 + meta_matrix[0, 8]))
             # 3 + meta_matrix[0, 8].astype(int))
             )
     # Initialize variables for looping:
     array_bottom = 0
     reference_time = meta_matrix[0, 3]
-    prev_master_time = meta_matrix[0, 3]
-    master_time = meta_matrix[0, 3]
-    old_system_tick = 0
-    running_tick_counter = 0
-    for sorted_packet_number, i in enumerate(meta_matrix):
-        packet_number = meta_matrix[sorted_packet_number, 7]
-        master_time = i[3]  # Resets the master time
-        if i[5]:
-            # We just suffered a macro packet loss...
-            print('unpacker_accel, resolving macroloss')
-            min_gap = (master_time - (prev_master_time + 1))
-            max_gap = min_gap + 2
-            min_n_rollovers = np.floor(min_gap / ((2 ** 16) * 10 ** -4))
-            max_n_rollovers = np.floor(max_gap / ((2 ** 16) * 10 ** -4))
-            if min_n_rollovers == max_n_rollovers:
-                running_tick_counter += min_n_rollovers * 2 ** 16
-            else:
-                pdb.set_trace()
-            # old_system_tick = 0
-            # running_tick_counter = 0
-        running_tick_counter += ((i[2] - old_system_tick) % (2 ** 16))
+    for packet_number, i in enumerate(meta_matrix):
+        if i[16]:
+            continue
+        running_tick_counter = i[14]
         backtrack_time = running_tick_counter - ((i[9] - 1) * intersample_tick_count)
         # Populate master clock time into array
         final_array[int(array_bottom):int(array_bottom + i[9]), 0] = np.array([reference_time] * int(i[9]))
@@ -603,14 +720,12 @@ def unpacker_accel(meta_matrix, input_json, intersample_tick_count):
         # Populate coarse clock time into array
         final_array[int(array_bottom):int(array_bottom + i[9]), -2] = np.array([reference_time] * int(i[9]))
         # Put packet number into array for debugging
-        final_array[int(array_bottom):int(array_bottom + i[9]), -1] = np.array([sorted_packet_number] * int(i[9]))
+        final_array[int(array_bottom):int(array_bottom + i[9]), -1] = np.array([packet_number] * int(i[9]))
         # Unpack timedomain data from original packets into array
         for accel_index, accel_channel in enumerate(['XSamples', 'YSamples', 'ZSamples']):
             final_array[int(array_bottom):int(array_bottom + i[9]), accel_index + 2] = \
             input_json[0]['AccelData'][int(i[7])][accel_channel]
         # Update counters for next loop
-        old_system_tick = i[2]
-        prev_master_time = i[3]
         array_bottom += i[9]
     # Convert systemTick into microseconds
     final_array[:, 1] = final_array[:, 1] * 100
