@@ -156,7 +156,6 @@ def correct_meta_matrix_time_displacement(
             'microloss', 'macroloss', 'bothloss',
             'packetSize', 'firstSampleTick', 'lastSampleTick']
         )
-    #
     # firstSampleTick, lastSampleTick = unpack_meta_matrix_time(
     #     meta_matrix, intersample_tick_count)
     # tdMeta['firstSampleTick'] = firstSampleTick
@@ -224,7 +223,7 @@ def process_meta_data(
     #
     if plotting:
         rxTDiff = metaDF['PacketRxUnixTime'].diff()
-        fig, ax = plt.subplots(4, 1, sharex=True, figsize=(15, 15))
+        fig, ax = plt.subplots(5, 1, figsize=(30, 15))
         twinAx = []
         # ax[0] checks for need to sort
         p0, = ax[0].plot(
@@ -247,6 +246,12 @@ def process_meta_data(
         p1, = ax[1].plot(
             metaDF.index, actualLatency,
             label='Rx - Gen')
+        ax[1].axhline(actualLatency.median(), c='r')
+        ax[1].text(
+                1, 0, 'mean = {:.2f} msec (std = {:.2f} msec)'.format(
+                    actualLatency.mean(), actualLatency.std()),
+                va='bottom', ha='right',
+                transform=ax[1].transAxes)
         # ax[2] deals with dataTypeSeq
         dtsDiff = metaDF['dataTypeSequence'].diff()
         dtsAx = ax[2].twinx()
@@ -318,6 +323,33 @@ def process_meta_data(
     metaDF.iloc[:, :] = unpack_meta_matrix_time(metaDF.to_numpy(), intersampleTickCount)
     #
     if plotting:
+        # ax[4] deals with packetGenTime vs lastSampleTick
+        lastSampleTickInMsec = metaDF.loc[~tsDropMask, 'lastSampleTick'] * 1e-1
+        residAx = ax[4].twinx()
+        twinP4, = residAx.plot(
+            metaDF.loc[~tsDropMask, 'PacketGenTime'],
+            lastSampleTickInMsec, 'co', label='system tick')
+        pCoeffs, regrStats = np.polynomial.polynomial.polyfit(
+            metaDF.loc[~tsDropMask, 'PacketGenTime'],
+            lastSampleTickInMsec, 1, full=True)
+        ssTot = ((lastSampleTickInMsec - lastSampleTickInMsec.mean()) ** 2).sum()
+        rSq = 1 - regrStats[0] / ssTot
+        sysTickHat =  np.polynomial.polynomial.polyval(
+            metaDF.loc[~tsDropMask, 'PacketGenTime'], pCoeffs)
+        sysTickResiduals = lastSampleTickInMsec - sysTickHat
+        regrStatement = 'sysTick = {:6.4e}*packetGenTime{:+6.4e}; R^2 = {:.3f}; std of residuals = {:.3f} msec'.format(
+            pCoeffs[1], pCoeffs[0], rSq[0], np.std(sysTickResiduals))
+        residAx.plot(
+            metaDF.loc[~tsDropMask, 'PacketGenTime'],
+           sysTickHat, 'r-', label='system tick (hat) | packetGen time')
+        p4, = ax[4].plot(
+            metaDF.loc[~tsDropMask, 'PacketGenTime'],
+            sysTickResiduals, '-', label='residuals')
+        ax[4].text(
+            1, 0, regrStatement,
+            va='bottom', ha='right',
+            transform=residAx.transAxes)
+        #
         ax[0].set_ylabel('RX diff (msec)')
         ax[0].set_title('RX Time')
         ax[0].yaxis.get_label().set_color(p0.get_color())
@@ -343,6 +375,15 @@ def process_meta_data(
         tsAx.set_ylabel('sec')
         tsAx.yaxis.get_label().set_color(twinP3.get_color())
         tsAx.legend(loc='lower right')
+        #
+        ax[4].set_title('systemTick (msec)')
+        ax[4].set_ylabel('msec')
+        ax[4].set_xlabel('PacketGenTime (msec)')
+        residAx.set_ylabel('msec')
+        ax[4].yaxis.get_label().set_color(p4.get_color())
+        ax[4].legend(loc='upper right')
+        residAx.legend(loc='lower right')
+        residAx.yaxis.get_label().set_color(twinP4.get_color())
     return metaDF.to_numpy(), fig, ax, twinAx
 
 
