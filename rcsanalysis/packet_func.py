@@ -12,9 +12,9 @@ groupConfigNames = ['TherapyConfigGroup{}'.format(grpIdx) for grpIdx in range(4)
 metaMatrixColumns = [
     'dataSize', 'dataTypeSequence',
     'systemTick', 'timestamp', 'microloss', 'macroloss', 'bothloss',
-    'packetIdx', 'chanSamplesLen', 'dataSizePerChannel', 'SampleRate',
+    'jsonPacketIdx', 'chanSamplesLen', 'dataSizePerChannel', 'SampleRate',
     'PacketGenTime', 'PacketRxUnixTime',
-    'firstSampleTick', 'lastSampleTick', 'globalSequence', 'skipPacket']
+    'firstSampleTick', 'lastSampleTick', 'globalSequence', 'skipPacket', 'packetNeedsFixing']
 
 def init_numpy_array(input_json, num_cols, data_type):
     num_rows = len(input_json[0][data_type])
@@ -42,6 +42,7 @@ def unpack_meta_matrix_time(
     lastSampleTick = np.zeros(meta_matrix.shape[0])
     unresolvedMacrolossIdx = []
     resolvedMacroloss = True
+    print('Unpacking meta matrix time')
     for packet_number, i in enumerate(meta_matrix):
         # packet_number = meta_matrix[sorted_packet_number, 7]
         if i[16]:
@@ -54,8 +55,6 @@ def unpack_meta_matrix_time(
             # We just suffered a macro packet loss...
             print('meta matrix: adding time to the running counter')
             if usePacketGenTime:
-                resolvedMacroloss = True
-                print('     resolved')
                 # msk = meta_matrix[:, 11] > 0
                 # plt.plot(meta_matrix[msk, 11]); plt.show()
                 # plt.plot(np.diff(meta_matrix[:, 3])); plt.show()
@@ -64,13 +63,25 @@ def unpack_meta_matrix_time(
                     gap = pGenT - prev_pGenT  # in msec
                 else:
                     gap = pRxT - prev_pRxT # in msec
-                n_rollovers = np.floor(gap / ((2 ** 16) * 10 ** -1))
-                running_tick_counter += n_rollovers * 2 ** 16
+                #
+                n_rollovers = np.floor(gap / ((2 ** 16) * 1e-1))
+                # did we just roll over?
+                gapRemainder = (gap - n_rollovers * (2 ** 16) * 1e-1)
+                # are we very close to a new rollover?
+                altGapRemainder = np.abs(gap - (n_rollovers + 1) * (2 ** 16) * 1e-1)
+                if not min(gapRemainder, altGapRemainder) < 250:
+                    resolvedMacroloss = True
+                    print('     resolved')
+                    running_tick_counter += n_rollovers * 2 ** 16
+                else:
+                    unresolvedMacrolossIdx.append(packet_number)
+                    resolvedMacroloss = False
+                    print('   unresolved')
             else:
                 min_gap = (master_time - (prev_master_time + 1))
                 max_gap = min_gap + 2
-                min_n_rollovers = np.floor(min_gap / ((2 ** 16) * 10 ** -4))
-                max_n_rollovers = np.floor(max_gap / ((2 ** 16) * 10 ** -4))
+                min_n_rollovers = np.floor(min_gap / ((2 ** 16) * 1e-4))
+                max_n_rollovers = np.floor(max_gap / ((2 ** 16) * 1e-4))
                 if min_n_rollovers == max_n_rollovers:
                     resolvedMacroloss = True
                     print('     resolved')
@@ -109,41 +120,77 @@ def unpack_meta_matrix_time(
 
 
 def correct_meta_matrix_consecutive_sys_tick(
-        meta_matrix, intersampleTickCount=None, frameLength=None, verbose=False):
+        meta_matrix, intersampleTickCount=None,
+        frameDuration=None, nominalFrameSize=None, 
+        forceRemoveEqualConsecutiveDataTypeSequence=False, verbose=False):
     # correct issue described on page 64 of summit user manual
     metaMatrix = pd.DataFrame(meta_matrix, columns=metaMatrixColumns)
     sysTickDiff = metaMatrix['systemTick'].diff()
-    tsDiff = metaMatrix['timestamp'].diff()
-    metaMatrix['rolloverGroup'] = ((sysTickDiff < 0) | (tsDiff > 6)).cumsum()
+    tsDiff = metaMatrix['PacketGenTime'].diff()
+    metaMatrix['rolloverGroup'] = ((sysTickDiff < 0) | (tsDiff > (2 ** 16 * 1e-1))).cumsum()
+    # metaMatrix['rolloverGroup'] = (sysTickDiff < 0).cumsum()
     # TODO access deviceLog to find what the nominal frame size actually is
-    if frameLength is None:
-        nominalFrameSize = metaMatrix['dataSizePerChannel'].value_counts().idxmax()
-        frameLength = nominalFrameSize * intersampleTickCount
-    packetsNeedFixing = []
+    if frameDuration is None:
+        # frameDuration is the duration in msec
+        # frameSize is the # of samples in the frame
+        if nominalFrameSize is None:
+            nominalFrameSize = metaMatrix['dataSizePerChannel'].value_counts().idxmax()
+            print('nominalFrameSize = {}'.format(nominalFrameSize))
+        frameDuration = nominalFrameSize * intersampleTickCount * 1e-1
     for name, group in metaMatrix.groupby('rolloverGroup'):
         # duplicateSysTick = group.duplicated('systemTick')
-        duplicateSysTick = group['systemTick'].diff() == 0
+        duplicateSysTick = (group['systemTick'].diff() == 0)
         if duplicateSysTick.any():
-            duplicateIdxs = duplicateSysTick.index[np.flatnonzero(duplicateSysTick)]
+            # duplicateIdxs = duplicateSysTick.index[np.flatnonzero(duplicateSysTick)]
+            duplicateIdxs = duplicateSysTick.loc[duplicateSysTick].index
+            alreadyVisited = pd.Series(False, index=group.index)
             for duplicateIdx in duplicateIdxs:
                 sysTickVal = group.loc[duplicateIdx, 'systemTick']
-                allOccurences = group.loc[group['systemTick'] == sysTickVal, :]
-                try:
-                    assert len(allOccurences) == 2
-                except:
-                    pdb.set_trace()
-                #  'dataTypeSequence' rolls over, correct for it
-                specialCase = (
-                    (allOccurences['dataTypeSequence'] == 255).any() &
-                    (allOccurences['dataTypeSequence'] == 0).any()
-                )
-                if specialCase:
-                    idxNeedsChanging = allOccurences['dataTypeSequence'].astype(np.int).idxmax()
+                allOccurences = group.loc[group['systemTick'] == sysTickVal, :].copy()
+                # mark these packets for deletion?
+                if len(allOccurences['dataTypeSequence'].unique()) == 1:
+                    if forceRemoveEqualConsecutiveDataTypeSequence:
+                        meta_matrix[allOccurences.index, -2] = True # "skipPacket"
                 else:
-                    idxNeedsChanging = allOccurences['dataTypeSequence'].astype(np.int).idxmin()
-                packetsNeedFixing.append(idxNeedsChanging)
-                meta_matrix[idxNeedsChanging, 2] = meta_matrix[idxNeedsChanging, 2] - frameLength
-    return meta_matrix, packetsNeedFixing
+                    # allOccurences['PacketGenTime'] - metaMatrix['PacketRxUnixTime'].min()
+                    # allOccurences['PacketRxUnixTime'] - metaMatrix['PacketRxUnixTime'].min()
+                    # allOccurences['timestamp']- metaMatrix['timestamp'].min()
+                    # try:
+                    #     assert len(allOccurences) == 2
+                    # except Exception:
+                    #     print('WARNING! More than 2 consecutive identical system ticks found')
+                    #     pdb.set_trace()
+                    #  'dataTypeSequence' rolls over, correct for it
+                    # dtsRolledOver = allOccurences['dataTypeSequence'].diff().fillna(1) < -100
+                    # addToDTS = allOccurences['dataTypeSequence'] ** 0 - 1
+                    # for subI, dtsRolled in dtsRolledOver.iteritems():
+                    #     if dtsRolled:
+                    #         addToDTS.loc[subI:] += 255
+                    # allOccurences.loc[:, 'dataTypeSequence'] += addToDTS
+                    # assert (allOccurences.loc[:, 'dataTypeSequence'].diff().fillna(1) >= 0).all()
+                    # specialCase = (
+                    #     (allOccurences['dataTypeSequence'] == 255).any() &
+                    #     (allOccurences['dataTypeSequence'] == 0).any()
+                    # )
+                    # 
+                    # if specialCase:
+                    #     idxNeedsChanging = allOccurences['dataTypeSequence'].astype(np.int).idxmax()
+                    # else:
+                    #     idxNeedsChanging = allOccurences['dataTypeSequence'].astype(np.int).idxmin()
+                    # pdb.set_trace()
+                    if not alreadyVisited.loc[allOccurences.index].all():
+                        addToSysTick = 10 * frameDuration * np.arange(-allOccurences.shape[0] + 1, 0)
+                        #
+                        #
+                        for j, idxNeedsChanging in enumerate(allOccurences.index[:-1]):
+                            meta_matrix[idxNeedsChanging, -1] = True
+                            newSysTick = meta_matrix[idxNeedsChanging, 2] + addToSysTick[j]
+                            # print('newSysTick = {}'.format(newSysTick))
+                            if newSysTick < 0:
+                                newSysTick += 2 ** 16
+                            meta_matrix[idxNeedsChanging, 2] = newSysTick
+                        alreadyVisited.loc[allOccurences.index] = True
+    return meta_matrix
 
 
 def correct_meta_matrix_time_displacement(
@@ -156,10 +203,6 @@ def correct_meta_matrix_time_displacement(
             'microloss', 'macroloss', 'bothloss',
             'packetSize', 'firstSampleTick', 'lastSampleTick']
         )
-    # firstSampleTick, lastSampleTick = unpack_meta_matrix_time(
-    #     meta_matrix, intersample_tick_count)
-    # tdMeta['firstSampleTick'] = firstSampleTick
-    # tdMeta['lastSampleTick'] = lastSampleTick
     # how far is this packet from the preceding one
     tdMeta['sampleGap'] = tdMeta['firstSampleTick'].values - tdMeta['lastSampleTick'].shift(1).values
     # how much does this packet overlap the next one?
@@ -170,8 +213,6 @@ def correct_meta_matrix_time_displacement(
     #
     tdMeta['packetsOverlapFuture'] = tdMeta['sampleOverlap'] > 0
     #
-    # packetsNeedFixing = tdMeta.index[
-    #     tdMeta['packetsNotLost'] & tdMeta['packetsOverlapFuture']]
     packetsNeedFixing = tdMeta.index[tdMeta['packetsOverlapFuture']]
     if plotting and packetsNeedFixing.any():
         ax = sns.distplot(
@@ -203,20 +244,25 @@ def correct_meta_matrix_time_displacement(
     # tdMeta.loc[packetsNeedFixing, 'systemTick'] = tdMeta.loc[
     #     packetsNeedFixing, 'systemTick'] - (round(correctiveValues) - intersample_tick_count)
     meta_matrix[:, 2] = tdMeta['systemTick'].values
+    meta_matrix[packetsNeedFixing, -1] = True
     # meta_matrix[:, 11] = tdMeta['packetsOverlapFuture'].to_numpy()
-    return meta_matrix, packetsNeedFixing
+    return meta_matrix
 
 
 def process_meta_data(
-        meta_matrix, sampleRateLookupDict=None,
-        intersampleTickCount=None, plotting=False, fixPacketGenTime=True):
+        meta_matrix, sampleRateLookupDict=None, frameSize=None, frameDuration=None,
+        intersampleTickCount=None, plotting=False, fixPacketGenTime=True,
+        forceRemoveEqualConsecutiveDataTypeSequence=True,
+        input_json=None):
     metaDF = pd.DataFrame(meta_matrix, columns=metaMatrixColumns)
-    #
+    metaDF.loc[:, 'packetNeedsFixing'] = metaDF.loc[:, 'packetNeedsFixing'].astype('bool')
+    metaDF.loc[:, 'skipPacket'] = metaDF.loc[:, 'skipPacket'].astype('bool')
+    ########
     metaDF.sort_values(
-        by=['PacketRxUnixTime', 'dataTypeSequence'],
+        by=['PacketRxUnixTime', 'dataTypeSequence', 'globalSequence'],
         kind='mergesort', inplace=True)
     metaDF.reset_index(drop=True, inplace=True)
-    #
+    ######## fixPacketGenTime
     if fixPacketGenTime:
         noGenTimeMask = metaDF['PacketGenTime'] < 0
         metaDF.loc[noGenTimeMask, 'PacketGenTime'] = np.nan
@@ -285,7 +331,7 @@ def process_meta_data(
             label='timestamp')
     else:
         fig, ax, twinAx = None, None, None
-    #
+    ######## fixPacketGenTime
     if fixPacketGenTime:
         latency = metaDF['PacketRxUnixTime'] - metaDF['PacketGenTime']
         latency = (
@@ -295,55 +341,129 @@ def process_meta_data(
         metaDF.loc[noGenTimeMask, 'PacketGenTime'] = (
             metaDF.loc[noGenTimeMask, 'PacketRxUnixTime'] -
             latency.loc[noGenTimeMask])
-    #
-    tsDropMask = (metaDF['timestamp'].diff() < 0)
-    metaDF.loc[:, 'skipPacket'] = tsDropMask.to_numpy()
+    ########
+    # drop packets due to irregular timestamp
+    #######
+    # tsDropMask = (metaDF['timestamp'].diff() < 0)
+    # metaDF.loc[:, 'skipPacket'] = tsDropMask.to_numpy()
+    # TODO: calc running median timestamp, remove outliers
+    metaDF.loc[:, 'skipPacket'] = (metaDF['timestamp'].diff() < 0)
     if plotting:
         tsAx.plot(
-            metaDF.index[tsDropMask],
-            metaDF.loc[tsDropMask, 'timestamp'],
+            metaDF.index[metaDF['skipPacket']],
+            metaDF.loc[metaDF['skipPacket'], 'timestamp'],
             'r*', label='dropped bc. of timestamp')
-    metaDF = metaDF.loc[~metaDF['skipPacket'], :]
-    metaDF.reset_index(drop=True, inplace=True)
+    if metaDF['skipPacket'].any():
+        print('Deleting {} packets because of irregular timestamps'.format(metaDF['skipPacket'].sum()))
+        metaDF = metaDF.loc[~metaDF['skipPacket'], :]
+        metaDF.reset_index(drop=True, inplace=True)
     #
     if intersampleTickCount is None:
         mostCommonSampleRateCode = metaDF['SampleRate'].value_counts().idxmax()
         fs = float(sampleRateLookupDict[mostCommonSampleRateCode])
         intersampleTickCount = (fs ** -1) / (100e-6)
-    #
-    metaDF.iloc[:, :], packetsNeedFixing = correct_meta_matrix_consecutive_sys_tick(
-        metaDF.to_numpy(), intersampleTickCount=intersampleTickCount)
+    if frameSize is None:
+        frameSize = (frameDuration) / (intersampleTickCount * 1e-1)
+        # pdb.set_trace()
+    ######## correct meta matrix consecutive sys tick
+    metaDF.iloc[:, :] = correct_meta_matrix_consecutive_sys_tick(
+        metaDF.to_numpy(),
+        intersampleTickCount=int(intersampleTickCount),
+        nominalFrameSize=frameSize,
+        forceRemoveEqualConsecutiveDataTypeSequence=forceRemoveEqualConsecutiveDataTypeSequence)
+    if metaDF['skipPacket'].any():
+        print('Deleting {} packets because of irregular dataTypeSequence'.format(metaDF['skipPacket'].sum()))
+        metaDF = metaDF.loc[~metaDF['skipPacket'], :]
+        metaDF.reset_index(drop=True, inplace=True)
+    ######## Check against repeated packets
+    equalConsecDTS = metaDF['dataTypeSequence'].diff().fillna(1) == 0
+    # metaDF.loc[505:508, :].T
+    # metaDF.loc[343:346, 'PacketRxUnixTime'] - metaDF['PacketRxUnixTime'].min()
+    if equalConsecDTS.any():
+        print('found equal consecutive datatypesequence!')
+        for rowIdx in equalConsecDTS.loc[equalConsecDTS].index:
+            currPacketIdx = metaDF.loc[rowIdx, 'jsonPacketIdx']
+            prevPacketIdx = metaDF.loc[rowIdx - 1, 'jsonPacketIdx']
+            if 'TimeDomainData' in input_json[0].keys():
+                nChan = int(metaDF.loc[rowIdx, 'chanSamplesLen'])
+                currData = np.concatenate(
+                    [
+                        input_json[0]['TimeDomainData'][int(currPacketIdx)]['ChannelSamples'][j]['Value']
+                        for j in range(nChan)
+                    ])
+                prevData = np.concatenate(
+                    [
+                        input_json[0]['TimeDomainData'][int(prevPacketIdx)]['ChannelSamples'][j]['Value']
+                        for j in range(nChan)
+                    ])
+            elif 'AccelData' in input_json[0].keys():
+                currData = np.concatenate(
+                    [
+                        input_json[0]['AccelData'][int(currPacketIdx)][j]
+                        for j in ['XSamples', 'YSamples', 'ZSamples']
+                    ])
+                prevData = np.concatenate(
+                    [
+                        input_json[0]['AccelData'][int(prevPacketIdx)][j]
+                        for j in ['XSamples', 'YSamples', 'ZSamples']
+                    ])
+            tossThisPacket = False
+            if currData.shape == prevData.shape:
+                if np.allclose(prevData, currData):
+                    print("Warning: repeated packet found")
+                    tossThisPacket = True
+            if forceRemoveEqualConsecutiveDataTypeSequence:
+                tossThisPacket = True
+            metaDF.loc[rowIdx, 'skipPacket'] = tossThisPacket
+        if metaDF['skipPacket'].any():
+            print('Deleting {} packets because of irregular dataTypeSequence'.format(metaDF['skipPacket'].sum()))
+            metaDF = metaDF.loc[~metaDF['skipPacket'], :]
+            metaDF.reset_index(drop=True, inplace=True)
+    packetsNeedFixing = metaDF.loc[metaDF['packetNeedsFixing'].astype('bool'), :].index
     if plotting:
         dtsAx.plot(
             metaDF.index[packetsNeedFixing],
             metaDF['dataTypeSequence'].iloc[packetsNeedFixing],
             'g*', label='equal consecutive system ticks')
+    ########
     metaDF.iloc[:, :] = code_micro_and_macro_packet_loss(metaDF.to_numpy())
-    #
+    ########
     metaDF.iloc[:, :] = unpack_meta_matrix_time(metaDF.to_numpy(), intersampleTickCount)
-    #
+    ########
+    # discard gross inconsistencies between systemTick and packetRxTime
+    metaDF.loc[:, 'skipPacket'] = (
+        (metaDF['lastSampleTick'].diff() * 1e-1) - metaDF['PacketRxUnixTime'].diff()
+        ).abs() > 1e3
+    if metaDF['skipPacket'].any():
+        print('Deleting {} packets because of irregular reported frame durations'.format(metaDF['skipPacket'].sum()))
+        metaDF = metaDF.loc[~metaDF['skipPacket'], :]
+        metaDF.reset_index(drop=True, inplace=True)
+        ########
+        metaDF.iloc[:, :] = code_micro_and_macro_packet_loss(metaDF.to_numpy())
+        ########
+        metaDF.iloc[:, :] = unpack_meta_matrix_time(metaDF.to_numpy(), intersampleTickCount)
     if plotting:
         # ax[4] deals with packetGenTime vs lastSampleTick
-        lastSampleTickInMsec = metaDF.loc[~tsDropMask, 'lastSampleTick'] * 1e-1
+        lastSampleTickInMsec = metaDF.loc[~metaDF['skipPacket'], 'lastSampleTick'] * 1e-1
         residAx = ax[4].twinx()
         twinP4, = residAx.plot(
-            metaDF.loc[~tsDropMask, 'PacketGenTime'],
+            metaDF.loc[~metaDF['skipPacket'], 'PacketGenTime'],
             lastSampleTickInMsec, 'co', label='system tick')
         pCoeffs, regrStats = np.polynomial.polynomial.polyfit(
-            metaDF.loc[~tsDropMask, 'PacketGenTime'],
+            metaDF.loc[~metaDF['skipPacket'], 'PacketGenTime'],
             lastSampleTickInMsec, 1, full=True)
         ssTot = ((lastSampleTickInMsec - lastSampleTickInMsec.mean()) ** 2).sum()
         rSq = 1 - regrStats[0] / ssTot
         sysTickHat =  np.polynomial.polynomial.polyval(
-            metaDF.loc[~tsDropMask, 'PacketGenTime'], pCoeffs)
+            metaDF.loc[~metaDF['skipPacket'], 'PacketGenTime'], pCoeffs)
         sysTickResiduals = lastSampleTickInMsec - sysTickHat
         regrStatement = 'sysTick = {:6.4e}*packetGenTime{:+6.4e}; R^2 = {:.3f}; std of residuals = {:.3f} msec'.format(
             pCoeffs[1], pCoeffs[0], rSq[0], np.std(sysTickResiduals))
         residAx.plot(
-            metaDF.loc[~tsDropMask, 'PacketGenTime'],
+            metaDF.loc[~metaDF['skipPacket'], 'PacketGenTime'],
            sysTickHat, 'r-', label='system tick (hat) | packetGen time')
         p4, = ax[4].plot(
-            metaDF.loc[~tsDropMask, 'PacketGenTime'],
+            metaDF.loc[~metaDF['skipPacket'], 'PacketGenTime'],
             sysTickResiduals, '-', label='residuals')
         ax[4].text(
             1, 0, regrStatement,
@@ -390,7 +510,7 @@ def process_meta_data(
 def extract_accel_meta_data(
         input_json, sampleRateLookupDict=None,
         intersampleTickCount=None, plotting=False, fixPacketGenTime=True):
-    meta_matrix = init_numpy_array(input_json, 17, 'AccelData')
+    meta_matrix = init_numpy_array(input_json, 18, 'AccelData')
     for index, packet in enumerate(input_json[0]['AccelData']):
         meta_matrix[index, 0] = packet['Header']['dataSize']
         meta_matrix[index, 1] = packet['Header']['dataTypeSequence']
@@ -411,17 +531,19 @@ def extract_accel_meta_data(
         # 14 will hold last sampleTick
         meta_matrix[index, 15] = packet['Header']['globalSequence']
         meta_matrix[index, 16] = False # 16 will hold instruction to skip
+        meta_matrix[index, 17] = False # 17 will mark whether the packet needed a systick adjustment
     meta_matrix, fig, ax, twinAx = process_meta_data(
         meta_matrix, sampleRateLookupDict=sampleRateLookupDict,
+        frameSize=8, # accel packets have 8 samples per packet
         intersampleTickCount=intersampleTickCount, plotting=plotting,
-        fixPacketGenTime=fixPacketGenTime)
+        fixPacketGenTime=fixPacketGenTime, input_json=input_json)
     return meta_matrix, fig, ax, twinAx
 
 
 def extract_td_meta_data(
-        input_json, sampleRateLookupDict=None,
+        input_json, sampleRateLookupDict=None, frameDuration=None,
         intersampleTickCount=None, plotting=False, fixPacketGenTime=True):
-    meta_matrix = init_numpy_array(input_json, 17, 'TimeDomainData')
+    meta_matrix = init_numpy_array(input_json, 18, 'TimeDomainData')
     for index, packet in enumerate(input_json[0]['TimeDomainData']):
         meta_matrix[index, 0] = packet['Header']['dataSize']
         meta_matrix[index, 1] = packet['Header']['dataTypeSequence']
@@ -440,10 +562,11 @@ def extract_td_meta_data(
         # 14 will hold last sampleTick
         meta_matrix[index, 15] = packet['Header']['globalSequence']
         meta_matrix[index, 16] = False # 16 will hold instruction to skip
+        meta_matrix[index, 17] = False # 17 will mark whether the packet needed a systick adjustment
     meta_matrix, fig, ax, twinAx = process_meta_data(
-        meta_matrix, sampleRateLookupDict=sampleRateLookupDict,
+        meta_matrix, sampleRateLookupDict=sampleRateLookupDict, frameDuration=frameDuration,
         intersampleTickCount=intersampleTickCount, plotting=plotting,
-        fixPacketGenTime=fixPacketGenTime)
+        fixPacketGenTime=fixPacketGenTime, input_json=input_json)
     return meta_matrix, fig, ax, twinAx
 
 
@@ -469,9 +592,10 @@ def extract_time_sync_meta_data(input_json):
                 'globalSequence': packet['Header']['globalSequence'],
                 'systemTick': packet['Header']['systemTick'],
                 'timestamp': packet['Header']['timestamp']['seconds'],
-                'packetIdx': index,
+                'jsonPacketIdx': index,
                 'microloss': 0, 'macroloss': 0, 'bothloss': 0,
                 'skipPacket': False,
+                'packetNeedsFixing': False,
                 # 'microseconds': 0,
                 # 'time_master': np.nan
                 }
@@ -481,12 +605,12 @@ def extract_time_sync_meta_data(input_json):
     #
     timeSyncData = timeSyncData.reindex(columns=metaMatrixColumns + ['LatencyMilliseconds'])
     sortedIndices = timeSyncData.sort_values(
-        by=['PacketRxUnixTime', 'dataTypeSequence'],
+        by=['PacketRxUnixTime', 'dataTypeSequence', 'globalSequence'],
         kind='mergesort').index.to_numpy()
     timeSyncData = timeSyncData.iloc[sortedIndices, :].reset_index(drop=True)
     #
-    timeSyncData.loc[:, metaMatrixColumns], packetsNeedFixing = correct_meta_matrix_consecutive_sys_tick(
-        timeSyncData.loc[:, metaMatrixColumns].to_numpy(), frameLength=1e4)
+    timeSyncData.loc[:, metaMatrixColumns] = correct_meta_matrix_consecutive_sys_tick(
+        timeSyncData.loc[:, metaMatrixColumns].to_numpy(), frameDuration=1e3)
     timeSyncData.loc[:, metaMatrixColumns] = code_micro_and_macro_packet_loss(
         timeSyncData.loc[:, metaMatrixColumns].to_numpy())
     timeSyncData.loc[:, metaMatrixColumns] = unpack_meta_matrix_time(
@@ -650,13 +774,16 @@ def extract_stim_meta_data_events(input_json, trialSegment=None):
             eventsList.append(theseEventsDF)
     return pd.concat(eventsList, ignore_index=True, sort=True)
 
+
 def code_micro_and_macro_packet_loss(meta_matrix):
     meta_matrix[np.where((np.diff(meta_matrix[:, 1]) % (2 ** 8)) > 1)[0] + 1, 4] = 1  # Top packet of microloss; nonconsecutive dataTypeSequence
     # meta_matrix[np.where((np.diff(meta_matrix[:, 3]) >= ((2 ** 16) * .0001)))[0] + 1, 5] = 1  # Top packet of macroloss; more than 6.5535 seconds apart
     # TODO: the low res clock cannot resolve differences > 1 sec, so call anything > 6 a macroloss
     # see UCSF code for how to handle this
+    # np.diff(meta_matrix[:, 12]).max()
     # meta_matrix[np.where((np.diff(meta_matrix[:, 3]) >= 6))[0] + 1, 5] = 1  # Top packet of macroloss; more than 6. seconds apart
-    meta_matrix[np.where((np.diff(meta_matrix[:, 12]) >= 6e3))[0] + 1, 5] = 1  # Top packet of macroloss; more than 6. seconds apart
+    # pdb.set_trace()
+    meta_matrix[np.where((np.diff(meta_matrix[:, 11]) >= (2 ** 16 * 1e-1)))[0] + 1, 5] = 1  # Top packet of macroloss; more than 6. seconds apart
     meta_matrix[:, 6] = ((meta_matrix[:, 4]).astype(int) & (meta_matrix[:, 5]).astype(int))  # Code coincidence of micro and macro loss
     return meta_matrix
 
