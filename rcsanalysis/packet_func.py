@@ -334,6 +334,7 @@ def process_meta_data(
     ######## fixPacketGenTime
     if fixPacketGenTime:
         latency = metaDF['PacketRxUnixTime'] - metaDF['PacketGenTime']
+        latency = latency.fillna(method='bfill').fillna(method='ffill')
         latency = (
             latency
             .rolling(50, min_periods=10, center=True)
@@ -449,9 +450,13 @@ def process_meta_data(
         twinP4, = residAx.plot(
             metaDF.loc[~metaDF['skipPacket'], 'PacketGenTime'],
             lastSampleTickInMsec, 'co', label='system tick')
-        pCoeffs, regrStats = np.polynomial.polynomial.polyfit(
-            metaDF.loc[~metaDF['skipPacket'], 'PacketGenTime'],
-            lastSampleTickInMsec, 1, full=True)
+        try:
+            pCoeffs, regrStats = np.polynomial.polynomial.polyfit(
+                metaDF.loc[~metaDF['skipPacket'], 'PacketGenTime'],
+                lastSampleTickInMsec, 1, full=True)
+        except:
+            traceback.print_exc()
+            pdb.set_trace()
         ssTot = ((lastSampleTickInMsec - lastSampleTickInMsec.mean()) ** 2).sum()
         rSq = 1 - regrStats[0] / ssTot
         sysTickHat =  np.polynomial.polynomial.polyval(
