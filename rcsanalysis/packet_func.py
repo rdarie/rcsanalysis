@@ -74,8 +74,10 @@ def unpack_meta_matrix_time(
                     print('     resolved')
                     running_tick_counter += n_rollovers * 2 ** 16
                 else:
-                    unresolvedMacrolossIdx.append(packet_number)
-                    resolvedMacroloss = False
+                    if packet_number < (meta_matrix.shape[0] - 1):
+                        unresolvedMacrolossIdx.append(packet_number)
+                    if len(unresolvedMacrolossIdx) > 0:
+                        resolvedMacroloss = False
                     print('   unresolved')
             else:
                 min_gap = (master_time - (prev_master_time + 1))
@@ -87,8 +89,10 @@ def unpack_meta_matrix_time(
                     print('     resolved')
                     running_tick_counter += min_n_rollovers * 2 ** 16
                 else:
-                    unresolvedMacrolossIdx.append(packet_number)
-                    resolvedMacroloss = False
+                    if packet_number < (meta_matrix.shape[0] - 1):
+                        unresolvedMacrolossIdx.append(packet_number)
+                    if len(unresolvedMacrolossIdx) > 0:
+                        resolvedMacroloss = False
                     print('   unresolved')
             # old_system_tick = 0
             # running_tick_counter = 0
@@ -342,6 +346,8 @@ def process_meta_data(
             latency
             .rolling(50, min_periods=10, center=True)
             .apply(lambda x : np.nanmean(x), raw=True))
+        latency.fillna(method='bfill', inplace=True)
+        latency.fillna(method='ffill', inplace=True)
         metaDF.loc[noGenTimeMask, 'PacketGenTime'] = (
             metaDF.loc[noGenTimeMask, 'PacketRxUnixTime'] -
             latency.loc[noGenTimeMask])
@@ -457,7 +463,11 @@ def process_meta_data(
             pCoeffs, regrStats = np.polynomial.polynomial.polyfit(
                 metaDF.loc[~metaDF['skipPacket'], 'PacketGenTime'],
                 lastSampleTickInMsec, 1, full=True)
+<<<<<<< HEAD
         except:
+=======
+        except Exception:
+>>>>>>> d499dae16d3921861685c62e975f042c6dfa3ef2
             traceback.print_exc()
             pdb.set_trace()
         ssTot = ((lastSampleTickInMsec - lastSampleTickInMsec.mean()) ** 2).sum()
