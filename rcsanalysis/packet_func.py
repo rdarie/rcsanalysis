@@ -74,8 +74,10 @@ def unpack_meta_matrix_time(
                     print('     resolved')
                     running_tick_counter += n_rollovers * 2 ** 16
                 else:
-                    unresolvedMacrolossIdx.append(packet_number)
-                    resolvedMacroloss = False
+                    if packet_number < (meta_matrix.shape[0] - 1):
+                        unresolvedMacrolossIdx.append(packet_number)
+                    if len(unresolvedMacrolossIdx) > 0:
+                        resolvedMacroloss = False
                     print('   unresolved')
             else:
                 min_gap = (master_time - (prev_master_time + 1))
@@ -87,8 +89,10 @@ def unpack_meta_matrix_time(
                     print('     resolved')
                     running_tick_counter += min_n_rollovers * 2 ** 16
                 else:
-                    unresolvedMacrolossIdx.append(packet_number)
-                    resolvedMacroloss = False
+                    if packet_number < (meta_matrix.shape[0] - 1):
+                        unresolvedMacrolossIdx.append(packet_number)
+                    if len(unresolvedMacrolossIdx) > 0:
+                        resolvedMacroloss = False
                     print('   unresolved')
             # old_system_tick = 0
             # running_tick_counter = 0
@@ -108,7 +112,10 @@ def unpack_meta_matrix_time(
     #
     for packet_number in unresolvedMacrolossIdx[::-1]:
         curr_system_tick = meta_matrix[packet_number, 2]
-        next_system_tick = meta_matrix[packet_number + 1, 2]
+        try:
+            next_system_tick = meta_matrix[packet_number + 1, 2]
+        except:
+            pdb.set_trace()
         sys_tick_increment = (next_system_tick - curr_system_tick) % (2 ** 16)
         lastSampleTick[packet_number] = lastSampleTick[packet_number + 1] - sys_tick_increment
         firstSampleTick[packet_number] = (
@@ -338,6 +345,8 @@ def process_meta_data(
             latency
             .rolling(50, min_periods=10, center=True)
             .apply(lambda x : np.nanmean(x), raw=True))
+        latency.fillna(method='bfill', inplace=True)
+        latency.fillna(method='ffill', inplace=True)
         metaDF.loc[noGenTimeMask, 'PacketGenTime'] = (
             metaDF.loc[noGenTimeMask, 'PacketRxUnixTime'] -
             latency.loc[noGenTimeMask])
@@ -449,9 +458,13 @@ def process_meta_data(
         twinP4, = residAx.plot(
             metaDF.loc[~metaDF['skipPacket'], 'PacketGenTime'],
             lastSampleTickInMsec, 'co', label='system tick')
-        pCoeffs, regrStats = np.polynomial.polynomial.polyfit(
-            metaDF.loc[~metaDF['skipPacket'], 'PacketGenTime'],
-            lastSampleTickInMsec, 1, full=True)
+        try:
+            pCoeffs, regrStats = np.polynomial.polynomial.polyfit(
+                metaDF.loc[~metaDF['skipPacket'], 'PacketGenTime'],
+                lastSampleTickInMsec, 1, full=True)
+        except Exception:
+            traceback.print_exc()
+            pdb.set_trace()
         ssTot = ((lastSampleTickInMsec - lastSampleTickInMsec.mean()) ** 2).sum()
         rSq = 1 - regrStats[0] / ssTot
         sysTickHat =  np.polynomial.polynomial.polyval(
