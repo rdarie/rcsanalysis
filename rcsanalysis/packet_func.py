@@ -107,13 +107,16 @@ def unpack_meta_matrix_time(
             prev_pRxT = pRxT
     #
     for packet_number in unresolvedMacrolossIdx[::-1]:
-        curr_system_tick = meta_matrix[packet_number, 2]
-        next_system_tick = meta_matrix[packet_number + 1, 2]
-        sys_tick_increment = (next_system_tick - curr_system_tick) % (2 ** 16)
-        lastSampleTick[packet_number] = lastSampleTick[packet_number + 1] - sys_tick_increment
-        firstSampleTick[packet_number] = (
-            lastSampleTick[packet_number] -
-            ((meta_matrix[packet_number, 9] - 1) * intersample_tick_count))
+        if packet_number < meta_matrix.shape[0]:
+            curr_system_tick = meta_matrix[packet_number, 2]
+            next_system_tick = meta_matrix[packet_number + 1, 2]
+            sys_tick_increment = (next_system_tick - curr_system_tick) % (2 ** 16)
+            lastSampleTick[packet_number] = lastSampleTick[packet_number + 1] - sys_tick_increment
+            firstSampleTick[packet_number] = (
+                lastSampleTick[packet_number] -
+                ((meta_matrix[packet_number, 9] - 1) * intersample_tick_count))
+        else:
+            pdb.set_trace()
     meta_matrix[:, 13] = firstSampleTick
     meta_matrix[:, 14] = lastSampleTick
     return meta_matrix
