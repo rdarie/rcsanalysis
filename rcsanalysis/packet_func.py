@@ -463,11 +463,7 @@ def process_meta_data(
             pCoeffs, regrStats = np.polynomial.polynomial.polyfit(
                 metaDF.loc[~metaDF['skipPacket'], 'PacketGenTime'],
                 lastSampleTickInMsec, 1, full=True)
-<<<<<<< HEAD
-        except:
-=======
         except Exception:
->>>>>>> d499dae16d3921861685c62e975f042c6dfa3ef2
             traceback.print_exc()
             pdb.set_trace()
         ssTot = ((lastSampleTickInMsec - lastSampleTickInMsec.mean()) ** 2).sum()
